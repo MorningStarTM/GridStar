@@ -7,7 +7,7 @@ from gridstar.grid_env.grid_env import GridStarEnv
 
 
 def test_basic():
-    env = GridStarEnv(env_name="l2rpn_case14_sandbox", max_actions=30)
+    env = GridStarEnv(env_name="l2rpn_case14_sandbox")
 
     print(f"Environment: l2rpn_case14_sandbox")
     print(f"Action size: {env.action_size} (1 do-nothing + {env.action_size - 1} topology)")
