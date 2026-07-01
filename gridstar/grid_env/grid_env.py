@@ -16,7 +16,6 @@ class GridStarEnv:
         self,
         env_name="l2rpn_case14_sandbox",
         thermal_limit=0.98,
-        max_actions=None,
         backend=None,
     ):
         params = Parameters()
@@ -34,18 +33,13 @@ class GridStarEnv:
         self.obs_space = self.env.observation_space
         self.act_space = self.env.action_space
 
-        self._build_action_set(max_actions)
+        self._build_action_set()
         self._obs_dim = None
 
-    def _build_action_set(self, max_actions):
+    def _build_action_set(self):
         do_nothing = self.act_space({})
         all_topos = self.act_space.get_all_unitary_topologies_set(self.act_space)
-
-        if max_actions is not None and max_actions < len(all_topos) + 1:
-            self.actions = [do_nothing] + all_topos[: max_actions - 1]
-        else:
-            self.actions = [do_nothing] + all_topos
-
+        self.actions = [do_nothing] + all_topos
         self.action_size = len(self.actions)
         self.do_nothing_idx = 0
 
