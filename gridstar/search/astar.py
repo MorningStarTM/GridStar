@@ -5,6 +5,7 @@ from typing import Optional
 
 from .node import SearchNode
 from .goal import is_goal
+from gridstar.grid_env.reward import RewardFunction
 
 
 @dataclass
@@ -53,6 +54,7 @@ class AStarSearch:
         max_expansions: int = 200,
         max_depth: int = 5,
         thermal_limit: float = 0.98,
+        reward_fn: RewardFunction = None,
     ):
         self.env = env
         self.policy = policy
@@ -60,6 +62,7 @@ class AStarSearch:
         self.max_expansions = max_expansions
         self.max_depth = max_depth
         self.thermal_limit = thermal_limit
+        self.reward_fn = reward_fn or RewardFunction(thermal_limit=thermal_limit)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -99,6 +102,21 @@ class AStarSearch:
             _, node = heapq.heappop(heap)
             n_expanded += 1
 
+            # Goal check at pop time (standard A*).
+            # Checking at generate time caused an early return before any
+            # depth-2 nodes were expanded, giving a depth-2 tree even when
+            # max_depth was much larger.
+            if is_goal(node.obs, self.thermal_limit):
+                return AStarResult(
+                    found=True,
+                    path=self._extract_path(node),
+                    all_nodes=all_nodes,
+                    edges=edges,
+                    goal_node=node,
+                    n_expanded=n_expanded,
+                    n_generated=n_generated,
+                )
+
             if node.depth >= self.max_depth:
                 continue
 
@@ -126,18 +144,6 @@ class AStarSearch:
                 all_nodes.append(child)
                 edges.append((node.node_id, child.node_id, action_idx))
                 n_generated += 1
-
-                if is_goal(child_obs, self.thermal_limit):
-                    return AStarResult(
-                        found=True,
-                        path=self._extract_path(child),
-                        all_nodes=all_nodes,
-                        edges=edges,
-                        goal_node=child,
-                        n_expanded=n_expanded,
-                        n_generated=n_generated,
-                    )
-
                 heapq.heappush(heap, (child.f, child))
 
         return AStarResult(
@@ -155,10 +161,7 @@ class AStarSearch:
     # ------------------------------------------------------------------
 
     def _edge_cost(self, child_obs, action_idx: int) -> float:
-        rho_max = float(child_obs.rho.max())
-        n_offline = int((~child_obs.line_status).sum())
-        penalty = 0.01 if action_idx != self.env.do_nothing_idx else 0.0
-        return max(rho_max - self.thermal_limit, 0.0) + 0.5 * n_offline + penalty
+        return self.reward_fn.edge_cost(child_obs, action_idx, self.env.do_nothing_idx)
 
     @staticmethod
     def _extract_path(node: SearchNode) -> list:

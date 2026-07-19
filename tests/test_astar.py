@@ -39,9 +39,9 @@ def test_astar_random():
     searcher = AStarSearch(
         env=env,
         policy=policy,
-        top_k=10,          # candidate actions per node
-        max_expansions=150,
-        max_depth=4,
+        top_k=5,           # narrow branching factor → budget reaches deeper levels
+        max_expansions=300,
+        max_depth=8,
         thermal_limit=env.thermal_limit,
     )
 
@@ -70,7 +70,7 @@ def test_astar_random():
     # ── 6. Visualise ──────────────────────────────────────────────
     os.makedirs(_OUT_DIR, exist_ok=True)
     save_path = os.path.join(_OUT_DIR, "astar_search_tree.png")
-    plot_search_tree(result, env, save_path=save_path, max_nodes=120)
+    plot_search_tree(result, env, save_path=save_path, max_nodes=200)
 
     print("\nAll assertions passed.")
 
