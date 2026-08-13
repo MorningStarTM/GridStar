@@ -1,7 +1,7 @@
 import heapq
 import itertools
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from .node import SearchNode
 from .goal import is_goal
@@ -55,7 +55,25 @@ class AStarSearch:
         max_depth: int = 5,
         thermal_limit: float = 0.98,
         reward_fn: RewardFunction = None,
+        safety_fn: Optional[Callable] = None,
     ):
+        """
+        Args:
+            env:          GridStarEnv wrapper.
+            policy:       BasePolicy supplying top_k_actions() and heuristic().
+            top_k:        candidate actions expanded per node.
+            max_expansions: hard node budget.
+            max_depth:    maximum search depth.
+            thermal_limit: ρ threshold for the goal test.
+            reward_fn:    RewardFunction used for edge costs; created with
+                          defaults if omitted.
+            safety_fn:    optional fast Stage-1 goal filter, callable
+                          obs → bool, produced by
+                          SafetyPredictor.as_goal_test(env.obs_to_vector).
+                          When supplied, a node is accepted as a goal only
+                          when BOTH safety_fn(obs) AND is_goal(obs) are True.
+                          When None (default), only is_goal() is used.
+        """
         self.env = env
         self.policy = policy
         self.top_k = top_k
@@ -63,6 +81,7 @@ class AStarSearch:
         self.max_depth = max_depth
         self.thermal_limit = thermal_limit
         self.reward_fn = reward_fn or RewardFunction(thermal_limit=thermal_limit)
+        self.safety_fn = safety_fn
 
     # ------------------------------------------------------------------
     # Public interface
@@ -106,7 +125,13 @@ class AStarSearch:
             # Checking at generate time caused an early return before any
             # depth-2 nodes were expanded, giving a depth-2 tree even when
             # max_depth was much larger.
-            if is_goal(node.obs, self.thermal_limit):
+            #
+            # Two-stage goal test:
+            #   Stage 1 — fast neural filter via safety_fn (one forward pass)
+            #   Stage 2 — exact is_goal() check (ρ_max threshold)
+            # When safety_fn is None, only Stage 2 runs.
+            passes_filter = (self.safety_fn is None) or self.safety_fn(node.obs)
+            if passes_filter and is_goal(node.obs, self.thermal_limit):
                 return AStarResult(
                     found=True,
                     path=self._extract_path(node),
