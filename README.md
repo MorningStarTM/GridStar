@@ -275,6 +275,297 @@ GridStar/
 
 ---
 
+## Usage
+
+### Environment
+
+```python
+from gridstar.grid_env.grid_env import GridStarEnv
+
+env = GridStarEnv(
+    env_name="l2rpn_case14_sandbox",
+    thermal_limit=0.98,          # ρ threshold for congestion / goal test
+)
+
+obs = env.reset()
+obs = env.advance_to_congestion(obs, max_steps=2000)   # fast-forward to a hot grid
+
+print(env.action_size)          # total actions (1 do-nothing + topology)
+print(env.obs_dim)              # flat observation vector length
+print(env.get_rho_max(obs))     # worst-line loading (float)
+print(env.is_congested(obs))    # True when ρ_max ≥ thermal_limit
+
+obs_vector = env.obs_to_vector(obs)   # numpy float32 array, shape (obs_dim,)
+```
+
+---
+
+### Action Space
+
+#### Global — `ActionConverter`
+
+Builds and indexes every unitary topology action across all substations.
+
+```python
+from gridstar.grid_env.actions import ActionConverter
+
+converter = ActionConverter(env.env)          # pass the raw grid2op env
+
+print(converter.n)                            # total topology actions
+action = converter.act(42)                    # index → grid2op action object
+idx    = converter.action_idx(action)         # grid2op action → index
+
+# Cluster-based action mask: only allow actions for substations [0, 3, 5]
+mask = converter.get_cluster_mask([0, 3, 5]) # bool array, shape (n_actions+1,)
+valid_indices = converter.masked_action_indices([0, 3, 5])
+
+# Apply mask to policy logits before softmax
+import torch
+from gridstar.grid_env.actions import ActionConverter
+logits = torch.randn(len(converter.actions))
+masked = ActionConverter.apply_action_mask(logits, mask)  # fill=-1e9 on blocked
+```
+
+#### Cluster-local — `MADiscActionConverter`
+
+Used in multi-agent settings where each agent owns a subset of substations.
+
+```python
+from gridstar.grid_env.actions import MADiscActionConverter
+
+sub_list = [0, 3, 5]                              # substations owned by this agent
+ma_conv  = MADiscActionConverter(env.env, sub_list)
+
+print(ma_conv.action_size())                       # actions for this cluster only
+action   = ma_conv.act(0)                          # local index → grid2op action
+```
+
+---
+
+### Substation Clustering
+
+`ClusterUtils` applies the **Louvain** community-detection algorithm to the grid's
+adjacency matrix and partitions substations into geographically coherent groups.
+
+```python
+from gridstar.grid_env.actions import ClusterUtils
+
+# {agent_id: [sub_id, sub_id, …]}
+clusters = ClusterUtils.cluster_substations(env.env)
+print(clusters)
+# e.g. {0: [0, 1, 4, 5], 1: [2, 3, 6], 2: [7, 8, 9, …]}
+
+# Count topology actions available to one cluster
+n_actions = ClusterUtils.cluster_action_count(clusters[0], env.env.action_space)
+
+# Connectivity matrix (n_sub × n_sub)
+matrix = ClusterUtils.create_connectivity_matrix(env.env)
+```
+
+---
+
+### A\* Search — Random Policy (baseline)
+
+`RandomPolicy` uses `h = 0` (admissible; reduces A\* to uniform-cost search) and
+selects candidate actions by random sampling. Useful for verifying the search loop
+and generating bootstrap training data before any network is trained.
+
+```python
+from gridstar.networks.policy import RandomPolicy
+from gridstar.search.astar import AStarSearch
+from gridstar.utils.visualize import plot_search_tree
+
+policy   = RandomPolicy(n_actions=env.action_size, seed=42)
+searcher = AStarSearch(
+    env=env,
+    policy=policy,
+    top_k=5,             # candidate actions expanded per node
+    max_expansions=300,  # hard node budget
+    max_depth=8,         # maximum search depth
+    thermal_limit=0.98,
+)
+
+result = searcher.search(obs)
+
+print(result.found)           # True / False
+print(result.n_expanded)      # nodes popped from the heap
+print(result.n_generated)     # nodes pushed onto the heap
+print(len(result.all_nodes))  # total nodes in the search tree
+
+if result.found:
+    for node in result.path:
+        print(f"depth={node.depth}  action={node.action_idx}  "
+              f"ρ_max={node.obs.rho.max():.4f}  g={node.g:.4f}")
+```
+
+**Edge cost** (how `g` accumulates at each step):
+
+```
+cost(s, a, s') = max(ρ_max(s') − 0.98, 0)   # congestion severity
+               + 0.5 × n_offline_lines(s')    # line-disconnection penalty
+               + 0.01 × (a ≠ do-nothing)      # action complexity
+```
+
+---
+
+### Reward Function
+
+`RewardFunction` is the single source of truth for both the A\* edge cost and the
+RL training reward — the same coefficient values drive both, so tuning one tunes both.
+
+```python
+from gridstar.grid_env.reward import RewardFunction
+
+rf = RewardFunction(
+    thermal_limit=0.98,
+    overflow_coeff=1.0,      # weight on per-line quadratic overflow penalty
+    margin_coeff=0.1,        # weight on per-line safety-margin reward
+    offline_coeff=0.5,       # penalty per disconnected line
+    action_coeff=0.01,       # flat penalty for non-do-nothing actions
+    goal_bonus=1.0,          # reward when ρ_max < threshold
+    blackout_penalty=-10.0,  # reward when episode ends in blackout
+)
+
+# RL reward (maximise during training)
+obs2, _, done, _ = env.step(action_idx=7)
+r = rf(obs2, action_idx=7, done=done)
+
+# A* edge cost (minimise during search)  — called internally by AStarSearch
+cost = rf.edge_cost(obs2, action_idx=7, do_nothing_idx=0)
+
+# Pass a custom reward function to the searcher
+searcher = AStarSearch(env=env, policy=policy, reward_fn=rf)
+```
+
+**Reward components:**
+
+| Component | Formula | Notes |
+|---|---|---|
+| Overflow penalty | `−Σ max(ρᵢ − θ, 0)²` | Quadratic; penalises all overloaded lines |
+| Safety margin | `+mean max(θ − ρᵢ, 0)` | Rewards headroom, not just staying under limit |
+| Offline lines | `−0.5 × n_offline` | Disconnected lines reduce grid redundancy |
+| Action penalty | `−0.01` if non-trivial | Discourages unnecessary topology changes |
+| Goal bonus | `+1.0` if ρ_max < θ | Sparse success signal |
+| Blackout penalty | `−10.0` if done | Sparse failure signal |
+
+---
+
+### Heuristic Network
+
+`HeuristicModel` wraps five linear-only backbones under a common interface.
+Pass `net=` to select the architecture; all remaining kwargs are forwarded to
+the chosen backbone.
+
+```python
+from gridstar.networks.heuristic import HeuristicModel
+
+# Create — pick one backbone
+h_net = HeuristicModel(obs_dim=env.obs_dim, net='vanilla')    # 3-layer MLP
+h_net = HeuristicModel(obs_dim=env.obs_dim, net='efficient')  # 2-layer, fast
+h_net = HeuristicModel(obs_dim=env.obs_dim, net='deep',       # residual blocks
+                        n_blocks=6, hidden_dim=512)
+h_net = HeuristicModel(obs_dim=env.obs_dim, net='wide',       # wide + LayerNorm
+                        hidden_dim=512, dropout=0.1)
+h_net = HeuristicModel(obs_dim=env.obs_dim, net='dueling')    # overflow + recovery heads
+
+print(h_net)
+# HeuristicModel(net='efficient', obs_dim=132, params=18,049)
+```
+
+**Available networks:**
+
+| `net=` | Architecture | Parameters (obs=132) | Best for |
+|---|---|---|---|
+| `vanilla` | 256 → 256 → 128 → 1, BatchNorm | ~132 K | General; large datasets |
+| `efficient` | 128 → 64 → 1, no norm | ~18 K | Fast A\* inference |
+| `deep` | 256 + 4 residual blocks → 64 → 1, LayerNorm | ~530 K | High accuracy |
+| `wide` | 512 → 512 → 1, LayerNorm, LeakyReLU | ~530 K | Broad feature interactions |
+| `dueling` | Shared trunk → overflow head + recovery head | ~100 K | Interpretable two-stream |
+
+All backbones end with `nn.Softplus()` so output is always ≥ 0, which is required for
+A\* admissibility.
+
+**Training batch:**
+
+```python
+import torch
+import torch.nn.functional as F
+
+x       = torch.from_numpy(obs_vectors).float()  # (batch, obs_dim)
+targets = torch.tensor(costs_to_goal).float().unsqueeze(1)  # (batch, 1)
+
+pred = h_net(x)                                  # (batch, 1)
+loss = F.mse_loss(pred, targets)
+loss.backward()
+```
+
+**Single-observation inference:**
+
+```python
+cost_estimate = h_net.predict(obs_vector)         # numpy array → float
+```
+
+---
+
+### A\* Search — Neural Heuristic
+
+Plug a trained `HeuristicModel` into the search by wrapping it with
+`as_heuristic()`, which converts a raw grid2op observation to a vector before
+the forward pass.
+
+```python
+from gridstar.networks.policy import NeuralHeuristicPolicy
+
+heuristic_fn = h_net.as_heuristic(env.obs_to_vector)
+
+policy = NeuralHeuristicPolicy(
+    n_actions=env.action_size,
+    heuristic_fn=heuristic_fn,
+    seed=0,
+)
+
+searcher = AStarSearch(env=env, policy=policy, top_k=5, max_depth=8)
+result   = searcher.search(obs)
+```
+
+The `as_heuristic()` wrapper handles the `obs → numpy → tensor → float` pipeline
+so `AStarSearch` stays unaware of observation preprocessing.
+
+---
+
+### Search Tree Visualisation
+
+```python
+from gridstar.utils.visualize import plot_search_tree
+
+# Save to file
+plot_search_tree(result, env, save_path="doc/astar_search_tree.png", max_nodes=200)
+
+# Or display interactively
+plot_search_tree(result, env)
+```
+
+Node colours:
+- **Bright green** — goal node (ρ_max < 0.98, solution found here)
+- **Orange** — mild overload (0.98 ≤ ρ < 1.05)
+- **Red** — severe overload (ρ ≥ 1.05)
+
+Solution-path edges are drawn in blue; action indices are labelled on those edges only.
+
+---
+
+### Running the Tests
+
+```bash
+# Environment + action space sanity checks
+python tests/test_grid_env.py
+
+# A* search with random policy + saves search tree PNG to doc/
+python tests/test_astar.py
+```
+
+---
+
 ## Open Research Questions
 
 1. **h(s) architecture:** MLP vs GNN vs Transformer — which best captures grid structure for cost prediction?
