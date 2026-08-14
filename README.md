@@ -251,10 +251,12 @@ GridStar/
 │   │   ├── heuristic.py          # h(s): cost-to-recovery estimator
 │   │   ├── policy.py             # π(s): deployable policy + A* action pruner
 │   │   └── safety.py             # Binary classifier for sustained safety
-│   ├── env/
+│   ├── grid_env/
 │   │   ├── grid_env.py           # Grid2Op environment wrapper
 │   │   ├── reward.py             # g(s) cost functions
 │   │   └── actions.py            # Action space reduction and filtering
+│   ├── data_utils/
+│   │   └── generator.py          # SafetyDataGenerator (3 collection strategies)
 │   ├── training/
 │   │   ├── data_collector.py     # Collect trajectories from A* episodes
 │   │   ├── trainer.py            # Self-improving training loop
@@ -263,11 +265,12 @@ GridStar/
 │   │   ├── obs.py                # Observation processing
 │   │   └── visualize.py          # Search tree visualization
 │   └── config.py                 # Configuration
+├── data/
+│   └── safety/                   # Generated .npz files (random / trained / attack)
 ├── tests/
 ├── notebooks/
 ├── configs/default.yaml
 ├── checkpoints/
-├── data/
 ├── main.py                       # Entry point
 ├── evaluate.py                   # Evaluate trained policy
 └── requirements.txt
@@ -551,6 +554,181 @@ Node colours:
 - **Red** — severe overload (ρ ≥ 1.05)
 
 Solution-path edges are drawn in blue; action indices are labelled on those edges only.
+
+---
+
+### Safety Predictor
+
+`SafetyPredictor` is a binary classifier that estimates whether the grid will remain
+safe for K consecutive do-nothing steps. It provides a fast neural filter that avoids
+running K expensive `simulate()` calls per candidate node during A\* search.
+
+```python
+from gridstar.networks.safety import SafetyPredictor
+
+# Create — five classifier backbones available
+sp = SafetyPredictor(obs_dim=env.obs_dim, net='efficient')   # default; fastest
+sp = SafetyPredictor(obs_dim=env.obs_dim, net='vanilla')     # BatchNorm MLP
+sp = SafetyPredictor(obs_dim=env.obs_dim, net='deep', n_blocks=4)  # residual
+sp = SafetyPredictor(obs_dim=env.obs_dim, net='wide')        # wide + LayerNorm
+sp = SafetyPredictor(obs_dim=env.obs_dim, net='ensemble', n_members=5)  # ensemble
+
+print(sp)
+# SafetyPredictor(net='efficient', obs_dim=132, params=18,049)
+```
+
+**Available networks:**
+
+| `net=` | Architecture | Notes |
+|---|---|---|
+| `efficient` | H → H/2 → 1, no norm | Default; best for inference speed |
+| `vanilla` | H → H/2 → H/4 → 1, BatchNorm | General purpose |
+| `deep` | proj → N residual blocks → H/4 → 1 | High accuracy |
+| `wide` | H → H/2 → 1, LayerNorm, LeakyReLU | Broad features |
+| `ensemble` | N × EfficientClassifier, mean logits | Uncertainty estimation |
+
+All backbones output **raw logits** — use `BCEWithLogitsLoss` for training.
+
+**Training:**
+
+```python
+import torch
+import torch.nn.functional as F
+
+x       = torch.from_numpy(obs_vectors).float()     # (batch, obs_dim)
+targets = torch.tensor(labels).float().unsqueeze(1) # (batch, 1)
+
+# Class-weight compensates for label imbalance (attacks → many label=0)
+pos_weight = torch.tensor([(1 - labels.mean()) / labels.mean()])
+loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+logits = sp(x)                   # (batch, 1) — raw logits
+loss   = loss_fn(logits, targets)
+loss.backward()
+```
+
+**Inference:**
+
+```python
+obs_vec = env.obs_to_vector(obs)
+
+prob    = sp.predict_proba(obs_vec)          # float in [0, 1]
+is_safe = sp.is_safe(obs_vec, threshold=0.9) # bool
+
+# Wire directly into AStarSearch as a two-stage goal filter
+safety_fn = sp.as_goal_test(env.obs_to_vector, threshold=0.9)
+searcher   = AStarSearch(env=env, policy=policy, safety_fn=safety_fn)
+```
+
+**Ensemble uncertainty** (only with `net='ensemble'`):
+
+```python
+sp_ens = SafetyPredictor(obs_dim=env.obs_dim, net='ensemble', n_members=5)
+std    = sp_ens.member_uncertainty(obs_vec)   # std across members; None for other nets
+```
+
+**Generating a label without touching environment state:**
+
+```python
+# Chains obs.simulate(do-nothing) K times — no env state mutation
+label = SafetyPredictor.collect_label(obs, do_nothing_action, k_steps=10, thermal_limit=0.98)
+# True → safe for 10 steps; False → overflow or blackout detected
+```
+
+---
+
+### Data Generation
+
+`SafetyDataGenerator` collects `(obs_vector, label)` training pairs using three
+complementary strategies. Import from `gridstar.data_utils`:
+
+```python
+from gridstar.data_utils.generator import SafetyDataGenerator
+
+gen = SafetyDataGenerator(
+    env_name="l2rpn_case14_sandbox",
+    k_steps=10,            # simulate K do-nothing steps to generate each label
+    thermal_limit=0.98,
+    save_dir="data/safety",  # output root; sub-dirs created automatically
+    use_lightsim=True,       # uses LightSimBackend if installed
+    seed=42,
+)
+```
+
+**Strategy 1 — Random policy** (broad coverage, skews label=1):
+
+```python
+gen.from_random_policy(
+    n_episodes=5,            # number of grid2op chronics to run
+    start_episode=0,         # first chronic ID
+    max_steps_per_episode=500,  # None → full episode
+)
+# saves: data/safety/random/episode_0.npz … episode_4.npz
+```
+
+**Strategy 2 — A\* search tree nodes** (focuses on planner's distribution):
+
+```python
+from gridstar.search.astar import AStarSearch
+from gridstar.networks.policy import RandomPolicy
+
+policy   = RandomPolicy(n_actions=gen.env.action_size)
+searcher = AStarSearch(gen.env, policy, top_k=5, max_expansions=200)
+
+gen.from_trained_policy(
+    searcher=searcher,
+    n_episodes=5,
+    max_steps_to_congestion=2000,   # advance each episode until ρ_max ≥ threshold
+)
+# saves: data/safety/trained/episode_0.npz … episode_4.npz
+```
+
+**Strategy 3 — Line attacks** (adversarial; skews label=0):
+
+```python
+gen.from_line_attacks(
+    n_episodes=20,           # random scenario draws per line
+    top_n_substations=5,     # attack lines at the N most connected substations
+    steps_after_attack=10,   # do-nothing steps collected after each disconnect
+    horizon_per_episode=72,  # timestep drawn uniformly from [0, horizon)
+)
+# saves: data/safety/attack/line_5_ep_0.npz … line_3_ep_19.npz
+```
+
+**Load and combine for training:**
+
+```python
+# All three strategies concatenated
+obs_vecs, labels = gen.load()
+print(obs_vecs.shape, labels.mean())      # (N, obs_dim), fraction safe
+
+# Single strategy
+obs_vecs, labels = gen.load(strategy="attack")
+
+# Cap files per strategy (quick smoke-test)
+obs_vecs, labels = gen.load(max_files=2)
+```
+
+**Saved file layout:**
+
+```
+data/safety/
+├── random/   episode_0.npz  episode_1.npz  …
+├── trained/  episode_0.npz  episode_1.npz  …
+└── attack/   line_5_ep_0.npz  line_3_ep_1.npz  …
+```
+
+Each `.npz` contains: `obs_vectors (N, obs_dim)`, `labels (N,)`, `rho_max (N,)`, `steps (N,)`.
+
+**Dataset balance note:**
+
+Line attacks heavily skew toward `label=0`; random policy skews toward `label=1`.
+Compensate with class-weighted loss:
+
+```python
+pos_weight = torch.tensor([(1 - labels.mean()) / labels.mean()])
+loss_fn    = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+```
 
 ---
 
