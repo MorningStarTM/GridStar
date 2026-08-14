@@ -732,6 +732,111 @@ loss_fn    = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 ---
 
+### Safety Predictor Trainer
+
+`SafetyPredictorTrainer` handles the full supervised training loop —
+class-weighted loss, LR scheduling, early stopping, and checkpointing.
+
+**Train from Python:**
+
+```python
+from gridstar.data_utils.generator import SafetyDataGenerator
+from gridstar.training.safety_trainer import SafetyPredictorTrainer
+
+gen = SafetyDataGenerator(env_name="l2rpn_case14_sandbox", save_dir="data/safety")
+obs_vecs, labels = gen.load()   # load all three strategies
+
+trainer = SafetyPredictorTrainer(
+    obs_dim=obs_vecs.shape[1],
+    net="efficient",        # backbone: vanilla / efficient / deep / wide / ensemble
+    hidden_dim=128,
+    dropout=0.0,
+    lr=1e-3,
+    weight_decay=1e-4,
+    batch_size=256,
+    epochs=50,
+    val_split=0.15,         # 15% held out for validation
+    patience=10,            # early-stop if val_loss doesn't improve for 10 epochs
+    threshold=0.9,          # decision threshold for is_safe() and metrics
+    save_dir="checkpoints/safety",
+    device="auto",          # GPU if available, else CPU
+)
+
+history = trainer.fit(obs_vecs, labels)
+# prints per-epoch table: train_loss, val_loss, val_acc, val_f1, lr, time
+# saves best checkpoint automatically to checkpoints/safety/safety_predictor.pt
+```
+
+**Evaluate on held-out data:**
+
+```python
+metrics = trainer.evaluate(obs_vecs, labels)
+# {'loss': 0.31, 'acc': 0.94, 'precision': 0.96, 'recall': 0.95,
+#  'f1': 0.95, 'tp': 820, 'fp': 34, 'fn': 42, 'tn': 104}
+```
+
+**Save / load checkpoint:**
+
+```python
+trainer.save("checkpoints/safety/safety_predictor.pt")   # explicit path
+trainer.load("checkpoints/safety/safety_predictor.pt")
+
+# Use the trained model in A*
+sp         = trainer.model
+safety_fn  = sp.as_goal_test(env.obs_to_vector, threshold=trainer.threshold)
+searcher   = AStarSearch(env=env, policy=policy, safety_fn=safety_fn)
+```
+
+---
+
+### CLI — `safety_trainer`
+
+Train directly from the command line via `main.py`:
+
+```bash
+# Train with defaults (efficient net, 50 epochs, all data in data/safety)
+python main.py safety_trainer
+
+# Custom net + attack data only
+python main.py safety_trainer --net wide --strategy attack --epochs 100
+
+# Deep net with residual blocks, custom LR, GPU
+python main.py safety_trainer --net deep --n-blocks 4 --lr 5e-4 --device cuda
+
+# Ensemble classifier, more members
+python main.py safety_trainer --net ensemble --n-members 7 --epochs 80
+
+# Quick smoke-test: 2 files per strategy, 5 epochs
+python main.py safety_trainer --max-files 2 --epochs 5
+```
+
+**All CLI flags:**
+
+| Group | Flag | Default | Description |
+|---|---|---|---|
+| Data | `--data-dir` | `data/safety` | Root dir of `.npz` files |
+| Data | `--strategy` | all | `random` / `trained` / `attack` |
+| Data | `--max-files` | — | Cap files per strategy |
+| Environment | `--env-name` | `l2rpn_case14_sandbox` | grid2op env |
+| Model | `--net` | `efficient` | Backbone architecture |
+| Model | `--hidden-dim` | `128` | First hidden layer width |
+| Model | `--dropout` | `0.0` | Dropout rate |
+| Model | `--n-blocks` | `3` | ResBlocks (`--net deep`) |
+| Model | `--n-members` | `5` | Ensemble members (`--net ensemble`) |
+| Training | `--lr` | `1e-3` | Adam learning rate |
+| Training | `--weight-decay` | `1e-4` | Adam L2 penalty |
+| Training | `--batch-size` | `256` | Mini-batch size |
+| Training | `--epochs` | `50` | Max epochs |
+| Training | `--val-split` | `0.15` | Validation fraction |
+| Training | `--patience` | `10` | Early-stopping patience |
+| Training | `--threshold` | `0.9` | Decision threshold |
+| Training | `--device` | `auto` | `cpu` / `cuda` / `cuda:N` |
+| Training | `--seed` | `42` | Random seed |
+| Output | `--save-dir` | `checkpoints/safety` | Checkpoint directory |
+| Output | `--checkpoint-name` | `safety_predictor.pt` | Checkpoint filename |
+
+---
+
 ### Running the Tests
 
 ```bash
