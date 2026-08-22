@@ -38,6 +38,7 @@ import os
 import random
 import warnings
 from collections import defaultdict
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import grid2op
@@ -559,7 +560,8 @@ class SafetyDataGenerator:
         if action_idxs is not None:
             arrays["actions"] = np.array(action_idxs, dtype=np.int32)
         np.savez_compressed(filepath, **arrays)
-        print(f"  → {filepath}")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  [{ts}] → {filepath}  ({len(obs_vecs)} steps)")
 
     # ── Line attack utilities ─────────────────────────────────────────────────
 
