@@ -217,3 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 doc/
+
+# GridStar — generated data and notebook outputs
+data/
+notebook/
