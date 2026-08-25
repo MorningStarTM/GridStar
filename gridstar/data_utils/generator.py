@@ -144,12 +144,14 @@ class SafetyDataGenerator:
         save_dir: str = "data/safety",
         use_lightsim: bool = True,
         seed: int = 42,
+        kaggle_dataset: Optional[str] = None,
     ):
         self.env_name = env_name
         self.k_steps = k_steps
         self.thermal_limit = thermal_limit
         self.save_dir = save_dir
         self.seed = seed
+        self.kaggle_dataset = kaggle_dataset
         random.seed(seed)
         np.random.seed(seed)
 
@@ -170,6 +172,10 @@ class SafetyDataGenerator:
         os.makedirs(os.path.join(save_dir, "random"),  exist_ok=True)
         os.makedirs(os.path.join(save_dir, "trained"), exist_ok=True)
         os.makedirs(os.path.join(save_dir, "attack"),  exist_ok=True)
+
+        if kaggle_dataset:
+            self._init_kaggle_metadata(kaggle_dataset)
+            print(f"Kaggle push enabled → {kaggle_dataset}")
 
     # ── Strategy 1: Random Policy — full episodes ─────────────────────────────
 
@@ -221,7 +227,7 @@ class SafetyDataGenerator:
                     action_idx = random.randint(0, self.env.action_size - 1)
                     action     = self.env.actions[action_idx]
                     obs_, _reward, done, _info = raw.step(action)
-                    print(f"action {action_idx}  ρ_max={obs.rho.max():.4f}  done={done}")
+                    #print(f"action {action_idx}  ρ_max={obs.rho.max():.4f}  done={done}")
 
                     # Compute everything before touching the lists — if _label
                     # throws, no partial append is left behind.
@@ -278,6 +284,7 @@ class SafetyDataGenerator:
             self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
             n1 = int(sum(labels))
             print(f"  {len(labels)} steps  safe={n1}  unsafe={len(labels) - n1}")
+            self._push_to_kaggle(f"random episode_{ep_id}")
 
     # ── Strategy 2: Trained Policy (A* nodes) ────────────────────────────────
 
@@ -350,6 +357,7 @@ class SafetyDataGenerator:
             self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
             n1 = int(sum(labels))
             print(f"  {len(labels)} nodes  safe={n1}  unsafe={len(labels) - n1}")
+            self._push_to_kaggle(f"trained episode_{ep_id}")
 
     # ── Strategy 3: Line Attacks ──────────────────────────────────────────────
 
@@ -473,6 +481,7 @@ class SafetyDataGenerator:
                     self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
                     n1 = int(sum(labels))
                     print(f"  {len(labels)} samples  safe={n1}  unsafe={len(labels) - n1}")
+                    self._push_to_kaggle(f"attack line_{line_id}_ep_{ep_id}")
 
     # ── Load ──────────────────────────────────────────────────────────────────
 
@@ -562,6 +571,44 @@ class SafetyDataGenerator:
         np.savez_compressed(filepath, **arrays)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"  [{ts}] → {filepath}  ({len(obs_vecs)} steps)")
+
+    # ── Kaggle push ───────────────────────────────────────────────────────────
+
+    def _init_kaggle_metadata(self, dataset: str) -> None:
+        """Write dataset-metadata.json required by the Kaggle API (once)."""
+        import json
+        meta_path = os.path.join(self.save_dir, "dataset-metadata.json")
+        if os.path.exists(meta_path):
+            return
+        _, slug = dataset.split("/", 1)
+        meta = {
+            "title": slug.replace("-", " ").title(),
+            "id": dataset,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"  created {meta_path}")
+
+    def _push_to_kaggle(self, version_note: str) -> None:
+        """Push save_dir to Kaggle dataset as a new version (no-op if disabled)."""
+        if not self.kaggle_dataset:
+            return
+        try:
+            import kaggle
+            kaggle.api.authenticate()
+            kaggle.api.dataset_create_version(
+                self.save_dir,
+                version_notes=version_note,
+                quiet=True,
+                convert_to_csv=False,
+                delete_old_versions=False,
+                dir_mode="zip",
+            )
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"  [{ts}] pushed → kaggle:{self.kaggle_dataset}  ({version_note})")
+        except Exception as e:
+            print(f"  [kaggle push failed] {e}")
 
     # ── Line attack utilities ─────────────────────────────────────────────────
 
