@@ -25,6 +25,10 @@ Examples
 
   # Train directly from a HuggingFace dataset (downloads + caches automatically)
   python main.py safety_trainer --hf-dataset ernestbeckham/gridstar-safety-data
+
+  # Pull only a range of random-policy episodes — much lighter on GPU/disk/network
+  python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
+      --strategy random --start-episode 0 --end-episode 50
 """
 
 import argparse
@@ -60,6 +64,15 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--hf-token", default=None,
         help="HuggingFace token. Falls back to $HF_TOKEN or `huggingface-cli login` cache.",
+    )
+    g.add_argument(
+        "--start-episode", type=int, default=None,
+        help="First episode id to pull from HF (inclusive). Requires --strategy "
+             "and --hf-dataset. Downloads only this range instead of the whole dataset.",
+    )
+    g.add_argument(
+        "--end-episode", type=int, default=None,
+        help="Last episode id to pull from HF (exclusive). Requires --strategy and --hf-dataset.",
     )
 
     g = p.add_argument_group("Model")
@@ -119,12 +132,63 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
 # ── Data loading helpers ──────────────────────────────────────────────────────
 
 
-def download_hf_dataset(repo_id: str, token: str = None) -> str:
-    """Download (or reuse cached) HuggingFace dataset repo; returns local dir."""
+def _build_hf_allow_patterns(strategy: str = None, start_episode: int = None, end_episode: int = None):
+    """
+    Build huggingface_hub `allow_patterns` so snapshot_download only pulls the
+    files actually needed — full strategy folder, or a specific episode range.
+
+    File naming on the hub (see SafetyDataGenerator._save):
+      random/episode_{id}.npz
+      trained/episode_{id}.npz
+      attack/line_{lid}_ep_{eid}.npz
+    """
+    if start_episode is not None or end_episode is not None:
+        if strategy is None:
+            raise ValueError(
+                "--start-episode/--end-episode require --strategy "
+                "(episode-range filtering needs to know the file naming pattern)."
+            )
+        if start_episode is None or end_episode is None:
+            raise ValueError("Both --start-episode and --end-episode must be set together.")
+
+        if strategy in ("random", "trained"):
+            return [f"{strategy}/episode_{i}.npz" for i in range(start_episode, end_episode)]
+        else:  # attack — line id is unknown ahead of time, match any line for each ep
+            return [f"attack/line_*_ep_{i}.npz" for i in range(start_episode, end_episode)]
+
+    if strategy is not None:
+        return [f"{strategy}/*.npz"]
+
+    return None  # no filter — full dataset
+
+
+def download_hf_dataset(
+    repo_id: str,
+    token: str = None,
+    strategy: str = None,
+    start_episode: int = None,
+    end_episode: int = None,
+) -> str:
+    """
+    Download (or reuse cached) HuggingFace dataset repo; returns local dir.
+
+    When `strategy` (and optionally an episode range) is given, only the
+    matching files are downloaded via `allow_patterns` — much lighter on
+    network/disk/GPU-idle-time than pulling the entire dataset.
+    """
     from huggingface_hub import snapshot_download
 
     token = token or os.environ.get("HF_TOKEN")
-    local_dir = snapshot_download(repo_id=repo_id, repo_type="dataset", token=token)
+    allow_patterns = _build_hf_allow_patterns(strategy, start_episode, end_episode)
+    if allow_patterns:
+        print(f"  pulling {len(allow_patterns)} pattern(s): {allow_patterns[:3]}{' ...' if len(allow_patterns) > 3 else ''}")
+
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        token=token,
+        allow_patterns=allow_patterns,
+    )
     return local_dir
 
 
@@ -168,7 +232,13 @@ def run_safety_trainer(args: argparse.Namespace) -> None:
     # ── Load data ────────────────────────────────────────────────────────────
     if args.hf_dataset:
         print(f"Downloading HuggingFace dataset: {args.hf_dataset}")
-        data_dir = download_hf_dataset(args.hf_dataset, token=args.hf_token)
+        data_dir = download_hf_dataset(
+            args.hf_dataset,
+            token=args.hf_token,
+            strategy=args.strategy,
+            start_episode=args.start_episode,
+            end_episode=args.end_episode,
+        )
         print(f"  cached at {data_dir}")
     else:
         data_dir = args.data_dir
