@@ -372,6 +372,8 @@ class SafetyDataGenerator:
     def from_line_attacks(
         self,
         n_episodes: int = 20,
+        start_episode: int = 0,
+        end_episode: Optional[int] = None,
         top_n_substations: int = 5,
         steps_after_attack: int = 10,
         horizon_per_episode: int = 72,
@@ -395,7 +397,14 @@ class SafetyDataGenerator:
 
         Args:
             n_episodes:          number of episode passes (each covers all lines
-                                 across all scenarios).
+                                 across all scenarios). Ignored when end_episode
+                                 is set.
+            start_episode:       first episode-pass index (inclusive). Lets you
+                                 split the ep_id range across parallel notebooks,
+                                 e.g. notebook A: 0-9, notebook B: 10-19.
+            end_episode:         last episode-pass index (exclusive). When set,
+                                 overrides n_episodes — runs exactly
+                                 [start_episode, end_episode).
             top_n_substations:   target lines connected to the top-N most
                                  connected substations.
             steps_after_attack:  do-nothing steps collected after each attack.
@@ -408,7 +417,9 @@ class SafetyDataGenerator:
         scenario_path = self.env.env.chronics_handler.path
         n_scenarios   = len(os.listdir(scenario_path))
 
-        for ep_id in range(n_episodes):
+        end = end_episode if end_episode is not None else start_episode + n_episodes
+
+        for ep_id in range(start_episode, end):
             for line_id in attack_lines:
                 print(f"[attack] ep={ep_id}  line={line_id}")
 
