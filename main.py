@@ -22,10 +22,17 @@ Examples
 
   # Quick smoke-test: 2 files per strategy, 5 epochs
   python main.py safety_trainer --max-files 2 --epochs 5
+
+  # Train directly from a HuggingFace dataset (downloads + caches automatically)
+  python main.py safety_trainer --hf-dataset ernestbeckham/gridstar-safety-data
 """
 
 import argparse
+import glob
+import os
 import sys
+
+import numpy as np
 
 
 # ── Sub-command argument definitions ─────────────────────────────────────────
@@ -45,11 +52,14 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
         "--max-files", type=int, default=None,
         help="Cap on files loaded per strategy (useful for quick tests).",
     )
-
-    g = p.add_argument_group("Environment")
     g.add_argument(
-        "--env-name", default="l2rpn_case14_sandbox",
-        help="grid2op environment name (used to obtain obs_dim).",
+        "--hf-dataset", default=None,
+        help="HuggingFace dataset repo id (e.g. owner/gridstar-safety-data). "
+             "When set, downloads/caches the dataset and trains from it instead of --data-dir.",
+    )
+    g.add_argument(
+        "--hf-token", default=None,
+        help="HuggingFace token. Falls back to $HF_TOKEN or `huggingface-cli login` cache.",
     )
 
     g = p.add_argument_group("Model")
@@ -106,17 +116,65 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+# ── Data loading helpers ──────────────────────────────────────────────────────
+
+
+def download_hf_dataset(repo_id: str, token: str = None) -> str:
+    """Download (or reuse cached) HuggingFace dataset repo; returns local dir."""
+    from huggingface_hub import snapshot_download
+
+    token = token or os.environ.get("HF_TOKEN")
+    local_dir = snapshot_download(repo_id=repo_id, repo_type="dataset", token=token)
+    return local_dir
+
+
+def load_npz_dataset(data_dir: str, strategy: str = None, max_files: int = None):
+    """
+    Load (obs_vectors, labels) from a directory of episode_*.npz / line_*.npz
+    files laid out as data_dir/{random,trained,attack}/*.npz. Pure numpy —
+    no grid2op environment needed just to read saved arrays.
+    """
+    strategies = ["random", "trained", "attack"] if strategy is None else [strategy]
+    all_obs, all_labels = [], []
+
+    for strat in strategies:
+        folder = os.path.join(data_dir, strat)
+        if not os.path.isdir(folder):
+            continue
+        files = sorted(glob.glob(os.path.join(folder, "*.npz")))
+        if max_files:
+            files = files[:max_files]
+        for fp in files:
+            d = np.load(fp)
+            if len(d["labels"]) == 0:
+                continue
+            all_obs.append(d["obs_vectors"])
+            all_labels.append(d["labels"])
+
+    if not all_obs:
+        raise FileNotFoundError(f"No data found in {data_dir}")
+
+    obs_vectors = np.concatenate(all_obs, axis=0).astype(np.float32)
+    labels      = np.concatenate(all_labels, axis=0).astype(np.float32)
+    return obs_vectors, labels
+
+
 # ── Sub-command runners ───────────────────────────────────────────────────────
 
 
 def run_safety_trainer(args: argparse.Namespace) -> None:
-    from gridstar.data_utils.generator import SafetyDataGenerator
     from gridstar.training.safety_trainer import SafetyPredictorTrainer
 
     # ── Load data ────────────────────────────────────────────────────────────
-    print(f"Loading data from: {args.data_dir}")
-    gen = SafetyDataGenerator(env_name=args.env_name, save_dir=args.data_dir)
-    obs_vectors, labels = gen.load(strategy=args.strategy, max_files=args.max_files)
+    if args.hf_dataset:
+        print(f"Downloading HuggingFace dataset: {args.hf_dataset}")
+        data_dir = download_hf_dataset(args.hf_dataset, token=args.hf_token)
+        print(f"  cached at {data_dir}")
+    else:
+        data_dir = args.data_dir
+
+    print(f"Loading data from: {data_dir}")
+    obs_vectors, labels = load_npz_dataset(data_dir, strategy=args.strategy, max_files=args.max_files)
     print(
         f"Dataset: {obs_vectors.shape[0]} samples  "
         f"obs_dim={obs_vectors.shape[1]}  pos_rate={labels.mean():.2%}"
