@@ -417,6 +417,13 @@ class SafetyDataGenerator:
         scenario_path = self.env.env.chronics_handler.path
         n_scenarios   = len(os.listdir(scenario_path))
 
+        # dst_step = ep_id * horizon + rand(...) grows unboundedly with ep_id and
+        # will exceed max_episode_duration() once ep_id is large. Wrap ep_id over
+        # the number of valid time-windows per episode so any ep_id stays in range
+        # while still cycling through different times of day.
+        max_duration = self.env.env.max_episode_duration()
+        n_windows    = max(max_duration // horizon_per_episode, 1)
+
         end = end_episode if end_episode is not None else start_episode + n_episodes
 
         for ep_id in range(start_episode, end):
@@ -449,11 +456,14 @@ class SafetyDataGenerator:
                     try:
                         ep_env.reset()
 
-                        # Timestep advances with episode so all hours are covered
+                        # Timestep advances with episode so all hours are covered;
+                        # wrapped by n_windows so it never exceeds max_duration.
+                        window   = ep_id % n_windows
                         dst_step = (
-                            ep_id * horizon_per_episode
-                            + random.randint(0, horizon_per_episode)
+                            window * horizon_per_episode
+                            + random.randint(0, horizon_per_episode - 1)
                         )
+                        dst_step = min(dst_step, max_duration - 1)
                         ep_env.fast_forward_chronics(max(dst_step - 1, 0))
                         obs, _r, done, _i = ep_env.step(ep_env.action_space({}))
                         if done:
