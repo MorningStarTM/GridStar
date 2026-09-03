@@ -1,8 +1,27 @@
-grid2op
-lightsim2grid
-torch
-numpy
-matplotlib
-networkx
-pyyaml
-tqdm
+# Core simulation
+grid2op==1.12.1
+pandapower==3.1.2          # grid2op default power-flow backend
+
+# Optional fast backend (recommended)
+lightsim2grid==0.10.3
+
+# Neural networks
+torch==2.0.1
+
+# Numerical / scientific
+numpy==1.26.4
+scipy==1.16.3              # csr_matrix for connectivity matrix in actions.py
+
+# Graph / clustering
+networkx==3.6.1            # search tree visualisation
+scikit-network==0.33.5     # Louvain clustering in ClusterUtils
+
+# Visualisation
+matplotlib==3.10.8
+
+# Training utilities
+tensorboard==2.20.0        # loss / metric logging
+tqdm==4.67.1               # progress bars
+
+# Config
+PyYAML==6.0.3
