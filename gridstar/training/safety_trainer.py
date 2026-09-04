@@ -5,7 +5,8 @@ Training signal: (obs_vector, label) pairs from SafetyDataGenerator.
 Loss:            BCEWithLogitsLoss with pos_weight for class imbalance.
 Optimiser:       Adam + ReduceLROnPlateau scheduler.
 Early stopping:  patience on validation loss.
-Checkpointing:   best model (lowest val_loss) saved automatically.
+Checkpointing:   best model (lowest val_loss) saved automatically as safetensors
+                (no pickle — checkpoints load across different torch versions).
 
 Quick start
 ───────────
@@ -32,6 +33,8 @@ from typing import Dict, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from safetensors import safe_open
+from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
 from gridstar.networks.safety import SafetyPredictor, AVAILABLE_NETS
@@ -86,7 +89,8 @@ class SafetyPredictorTrainer:
     patience:         early-stopping patience on val_loss (default 10).
     threshold:        decision threshold for metrics and is_safe() (default 0.9).
     save_dir:         directory for checkpoint files (default checkpoints/safety).
-    checkpoint_name:  filename for the best-model checkpoint (default safety_predictor.pt).
+    checkpoint_name:  filename for the best-model checkpoint
+                      (default safety_predictor.safetensors).
     device:           'auto', 'cpu', 'cuda', or 'cuda:N' (default 'auto').
     seed:             random seed for reproducible train/val splits (default 42).
     **net_kwargs:     forwarded to the backbone — e.g. n_blocks=4 for 'deep',
@@ -107,7 +111,7 @@ class SafetyPredictorTrainer:
         patience: int = 10,
         threshold: float = 0.9,
         save_dir: str = "checkpoints/safety",
-        checkpoint_name: str = "safety_predictor.pt",
+        checkpoint_name: str = "safety_predictor.safetensors",
         device: str = "auto",
         seed: int = 42,
         **net_kwargs,
@@ -270,34 +274,37 @@ class SafetyPredictorTrainer:
 
     def save(self, path: Optional[str] = None) -> None:
         """
-        Save model weights + metadata to disk.
+        Save model weights + metadata to disk in safetensors format.
 
-        The checkpoint is loadable with load() and compatible with
-        SafetyPredictor state_dict format.
+        Unlike torch.save (pickle-based), safetensors stores raw tensors with
+        a small string-only metadata header — no pickle opcodes, so checkpoints
+        load cleanly across different torch versions and don't execute
+        arbitrary code on load. Loadable with load().
         """
         path = path or self.checkpoint_path
-        torch.save(
-            {
-                "model_state": self._model.state_dict(),
-                "obs_dim":     self._model.obs_dim,
-                "net_name":    self._model.net_name,
-                "threshold":   self.threshold,
-            },
-            path,
-        )
+        state_dict = self._model.state_dict()
+        tensors = {k: v.contiguous().cpu() for k, v in state_dict.items()}
+        metadata = {
+            "obs_dim":   str(self._model.obs_dim),
+            "net_name":  self._model.net_name,
+            "threshold": str(self.threshold),
+        }
+        save_file(tensors, path, metadata=metadata)
 
     def load(self, path: Optional[str] = None) -> None:
         """
-        Load model weights from a checkpoint produced by save().
+        Load model weights from a safetensors checkpoint produced by save().
 
-        The trainer's threshold is also restored from the checkpoint so that
-        evaluate() and the model's is_safe() use the same value that was set
-        at training time.
+        The trainer's threshold is also restored from the checkpoint metadata
+        so that evaluate() and the model's is_safe() use the same value that
+        was set at training time.
         """
         path = path or self.checkpoint_path
-        ckpt = torch.load(path, map_location=self.device)
-        self._model.load_state_dict(ckpt["model_state"])
-        self.threshold = ckpt.get("threshold", self.threshold)
+        state_dict = load_file(path, device=str(self.device))
+        self._model.load_state_dict(state_dict)
+        with safe_open(path, framework="pt", device=str(self.device)) as f:
+            metadata = f.metadata() or {}
+        self.threshold = float(metadata.get("threshold", self.threshold))
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
