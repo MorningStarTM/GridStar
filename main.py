@@ -124,7 +124,7 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
         help="Directory for the best-model checkpoint.",
     )
     g.add_argument(
-        "--checkpoint-name", default="safety_predictor.pt",
+        "--checkpoint-name", default="safety_predictor.safetensors",
         help="Filename for the saved checkpoint.",
     )
 
