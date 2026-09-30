@@ -221,3 +221,4 @@ doc/
 # GridStar — generated data and notebook outputs
 data/
 notebook/
+/deploy
