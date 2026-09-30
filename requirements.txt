@@ -2,11 +2,18 @@
 grid2op==1.12.1
 pandapower==3.1.2          # grid2op default power-flow backend
 
+dill==0.4.0
+loguru
+
 # Optional fast backend (recommended)
 lightsim2grid==0.10.3
 
 # Neural networks
-torch==2.0.1
+
+safetensors==0.4.5         # checkpoint format — version-agnostic, no pickle
+
+# HuggingFace dataset push/pull
+huggingface_hub==0.26.2
 
 # Numerical / scientific
 numpy==1.26.4
