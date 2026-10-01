@@ -147,6 +147,7 @@ class SafetyDataGenerator:
         kaggle_dataset: Optional[str] = None,
         hf_dataset: Optional[str] = None,
         hf_token: Optional[str] = None,
+        monitor_dir: str = "monitor",
     ):
         self.env_name = env_name
         self.k_steps = k_steps
@@ -156,6 +157,10 @@ class SafetyDataGenerator:
         self.kaggle_dataset = kaggle_dataset
         self.hf_dataset = hf_dataset
         self.hf_token = hf_token
+        self.monitor_dir = monitor_dir
+        self._status_path = os.path.join(monitor_dir, "status.json")
+        self._stop_path   = os.path.join(monitor_dir, "STOP")
+        os.makedirs(monitor_dir, exist_ok=True)
         random.seed(seed)
         np.random.seed(seed)
 
@@ -214,8 +219,13 @@ class SafetyDataGenerator:
             n_eps = n_episodes or self.env.chronic_count
             end   = min(start_episode + n_eps, self.env.chronic_count)
         raw   = self.env.env   # raw grid2op env
+        self._clear_stop_flag()
 
         for ep_id in range(start_episode, end):
+            if self._stop_requested():
+                print(f"[random] stop requested — halting before episode {ep_id}.")
+                break
+
             print(f"[random] episode {ep_id}/{end - 1}")
 
             raw.set_id(ep_id)
@@ -290,6 +300,7 @@ class SafetyDataGenerator:
             self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
             n1 = int(sum(labels))
             print(f"  {len(labels)} steps  safe={n1}  unsafe={len(labels) - n1}")
+            self._write_status("random", ep_id, len(labels), n1, extra={"range": [start_episode, end]})
             self._push_to_kaggle(f"random episode_{ep_id}")
             self._push_to_hf(fname)
 
@@ -327,7 +338,13 @@ class SafetyDataGenerator:
             n_eps = n_episodes or self.env.chronic_count
             end   = min(start_episode + n_eps, self.env.chronic_count)
 
+        self._clear_stop_flag()
+
         for ep_id in range(start_episode, end):
+            if self._stop_requested():
+                print(f"[trained] stop requested — halting before episode {ep_id}.")
+                break
+
             print(f"[trained] episode {ep_id}/{end - 1}")
             obs = self.env.reset(chronic_id=ep_id)
             obs = self.env.advance_to_congestion(obs, max_steps=max_steps_to_congestion)
@@ -364,6 +381,7 @@ class SafetyDataGenerator:
             self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
             n1 = int(sum(labels))
             print(f"  {len(labels)} nodes  safe={n1}  unsafe={len(labels) - n1}")
+            self._write_status("trained", ep_id, len(labels), n1, extra={"range": [start_episode, end]})
             self._push_to_kaggle(f"trained episode_{ep_id}")
             self._push_to_hf(fname)
 
@@ -425,9 +443,18 @@ class SafetyDataGenerator:
         n_windows    = max(max_duration // horizon_per_episode, 1)
 
         end = end_episode if end_episode is not None else start_episode + n_episodes
+        self._clear_stop_flag()
+        stop_now = False
 
         for ep_id in range(start_episode, end):
+            if stop_now:
+                break
             for line_id in attack_lines:
+                if self._stop_requested():
+                    print(f"[attack] stop requested — halting before ep={ep_id} line={line_id}.")
+                    stop_now = True
+                    break
+
                 print(f"[attack] ep={ep_id}  line={line_id}")
 
                 obs_vecs:    list = []
@@ -510,6 +537,10 @@ class SafetyDataGenerator:
                     self._save(obs_vecs, labels, rho_vals, steps, fname, action_idxs)
                     n1 = int(sum(labels))
                     print(f"  {len(labels)} samples  safe={n1}  unsafe={len(labels) - n1}")
+                    self._write_status(
+                        "attack", ep_id, len(labels), n1,
+                        extra={"range": [start_episode, end], "line_id": line_id},
+                    )
                     self._push_to_kaggle(f"attack line_{line_id}_ep_{ep_id}")
                     self._push_to_hf(fname)
 
@@ -601,6 +632,35 @@ class SafetyDataGenerator:
         np.savez_compressed(filepath, **arrays)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"  [{ts}] → {filepath}  ({len(obs_vecs)} steps)")
+
+    # ── Monitoring / remote stop ─────────────────────────────────────────────
+
+    def _write_status(self, strategy: str, ep_id, n_samples: int, n_safe: int, extra: Optional[dict] = None) -> None:
+        """Write progress to monitor_dir/status.json — read by monitor_server.py."""
+        import json
+        status = {
+            "strategy":    strategy,
+            "episode":     ep_id,
+            "n_samples":   n_samples,
+            "n_safe":      n_safe,
+            "n_unsafe":    n_samples - n_safe,
+            "safe_rate":   (n_safe / n_samples) if n_samples else 0.0,
+            "updated_at":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if extra:
+            status.update(extra)
+        tmp_path = self._status_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(status, f, indent=2)
+        os.replace(tmp_path, self._status_path)  # atomic — avoids partial reads
+
+    def _stop_requested(self) -> bool:
+        """True if monitor_server.py's Stop button wrote the flag file."""
+        return os.path.exists(self._stop_path)
+
+    def _clear_stop_flag(self) -> None:
+        if os.path.exists(self._stop_path):
+            os.remove(self._stop_path)
 
     # ── Kaggle push ───────────────────────────────────────────────────────────
 
