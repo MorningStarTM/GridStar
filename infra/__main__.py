@@ -4,6 +4,9 @@ GridStar data-generation EC2 instance — one stack per episode range.
 Config (set per-stack with `pulumi config set`):
     startEpisode   int     first episode (inclusive)
     endEpisode     int     last episode (exclusive)
+    seed           int     RNG seed — MUST differ across instances, otherwise
+                           overlapping ep_id ranges produce byte-identical
+                           duplicate data (same random policy + chronic shuffle)
     myIp           string  your IP in CIDR form, e.g. 203.189.189.170/32
     keyName        string  existing EC2 key pair name, e.g. gridstar-key
     hfToken        secret  HuggingFace write token
@@ -11,6 +14,7 @@ Config (set per-stack with `pulumi config set`):
 Usage:
     pulumi config set startEpisode 860
     pulumi config set endEpisode 900
+    pulumi config set seed 7                    # different per stack!
     pulumi config set myIp 203.189.189.170/32
     pulumi config set keyName gridstar-key
     pulumi config set --secret hfToken hf_xxxxxxxxxxxx
@@ -23,6 +27,7 @@ import pulumi_aws as aws
 config = pulumi.Config()
 start_episode = config.require_int("startEpisode")
 end_episode   = config.require_int("endEpisode")
+seed          = config.require_int("seed")
 my_ip         = config.require("myIp")
 key_name      = config.require("keyName")
 hf_token      = config.require_secret("hfToken")
@@ -67,7 +72,9 @@ ami = aws.ec2.get_ami(
 # ── User-data: bakes in every fix learned the hard way on the manual instance
 #    - Python 3.11 via deadsnakes (Ubuntu 26.04 ships 3.14, too new for torch/numpy pins)
 #    - torch installed from the CPU-only index (avoids the 554MB CUDA bundle)
-#    - episode range injected via sed into data_main.py
+#    - episode range passed via env vars (data_main.py reads START_EPISODE/
+#      END_EPISODE) — NOT sed text-substitution, which silently failed to
+#      match across data_main.py's multi-line call signature
 #    - both data_main.py and monitor_server.py launched unattended on boot
 user_data = pulumi.Output.all(hf_token).apply(lambda args: f"""#!/bin/bash
 set -ex
@@ -87,12 +94,13 @@ pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 
-sed -i -E "s/start_episode=[0-9]+, end_episode=[0-9]+/start_episode={start_episode}, end_episode={end_episode}/" data_main.py
-
 chown -R ubuntu:ubuntu /home/ubuntu/GridStar
 
 cat > /home/ubuntu/GridStar/.env <<EOF
 export HF_TOKEN={args[0]}
+export START_EPISODE={start_episode}
+export END_EPISODE={end_episode}
+export SEED={seed}
 EOF
 chown ubuntu:ubuntu /home/ubuntu/GridStar/.env
 
