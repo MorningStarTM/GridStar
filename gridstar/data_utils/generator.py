@@ -148,6 +148,7 @@ class SafetyDataGenerator:
         hf_dataset: Optional[str] = None,
         hf_token: Optional[str] = None,
         monitor_dir: str = "monitor",
+        delete_after_push: bool = False,
     ):
         self.env_name = env_name
         self.k_steps = k_steps
@@ -157,6 +158,7 @@ class SafetyDataGenerator:
         self.kaggle_dataset = kaggle_dataset
         self.hf_dataset = hf_dataset
         self.hf_token = hf_token
+        self.delete_after_push = delete_after_push
         self.monitor_dir = monitor_dir
         self._status_path = os.path.join(monitor_dir, "status.json")
         self._stop_path   = os.path.join(monitor_dir, "STOP")
@@ -302,7 +304,8 @@ class SafetyDataGenerator:
             print(f"  {len(labels)} steps  safe={n1}  unsafe={len(labels) - n1}")
             self._write_status("random", ep_id, len(labels), n1, extra={"range": [start_episode, end]})
             self._push_to_kaggle(f"random episode_{ep_id}")
-            self._push_to_hf(fname)
+            pushed_ok = self._push_to_hf(fname)
+            self._maybe_delete_local(fname, pushed_ok)
 
     # ── Strategy 2: Trained Policy (A* nodes) ────────────────────────────────
 
@@ -383,7 +386,8 @@ class SafetyDataGenerator:
             print(f"  {len(labels)} nodes  safe={n1}  unsafe={len(labels) - n1}")
             self._write_status("trained", ep_id, len(labels), n1, extra={"range": [start_episode, end]})
             self._push_to_kaggle(f"trained episode_{ep_id}")
-            self._push_to_hf(fname)
+            pushed_ok = self._push_to_hf(fname)
+            self._maybe_delete_local(fname, pushed_ok)
 
     # ── Strategy 3: Line Attacks ──────────────────────────────────────────────
 
@@ -542,7 +546,8 @@ class SafetyDataGenerator:
                         extra={"range": [start_episode, end], "line_id": line_id},
                     )
                     self._push_to_kaggle(f"attack line_{line_id}_ep_{ep_id}")
-                    self._push_to_hf(fname)
+                    pushed_ok = self._push_to_hf(fname)
+                    self._maybe_delete_local(fname, pushed_ok)
 
     # ── Load ──────────────────────────────────────────────────────────────────
 
@@ -718,14 +723,18 @@ class SafetyDataGenerator:
         except Exception as e:
             print(f"  [kaggle push failed] {e}")
 
-    def _push_to_hf(self, filepath: str) -> None:
+    def _push_to_hf(self, filepath: str) -> bool:
         """Upload a single npz file to HuggingFace Hub dataset (no-op if disabled).
 
         Uses per-file upload so parallel notebooks never overwrite each other —
         each notebook only touches its own episode files.
+
+        Returns True on confirmed successful upload, False otherwise (disabled
+        or failed) — callers use this to decide whether it's safe to delete
+        the local copy (see delete_after_push).
         """
         if not self.hf_dataset:
-            return
+            return False
         try:
             from huggingface_hub import HfApi
             api = HfApi(token=self.hf_token)
@@ -740,8 +749,24 @@ class SafetyDataGenerator:
             )
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"  [{ts}] pushed → hf:{self.hf_dataset}/{path_in_repo}")
+            return True
         except Exception as e:
             print(f"  [hf push failed] {e}")
+            return False
+
+    def _maybe_delete_local(self, filepath: str, pushed_ok: bool) -> None:
+        """Delete the local npz once it's safely on HuggingFace (if enabled).
+
+        Keeps local disk usage near-zero on long runs instead of filling the
+        EBS volume — the HF copy is the durable one once pushed_ok is True.
+        """
+        if not (self.delete_after_push and pushed_ok):
+            return
+        try:
+            os.remove(filepath)
+            print(f"  deleted local copy: {filepath}")
+        except OSError as e:
+            print(f"  [local delete failed] {e}")
 
     # ── Line attack utilities ─────────────────────────────────────────────────
 
