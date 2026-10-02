@@ -9,11 +9,17 @@ loguru
 lightsim2grid==0.10.3
 
 # Neural networks
-
+# torch is intentionally NOT pinned here — the default PyPI build bundles CUDA
+# (500MB+) even on CPU-only machines. Install it separately first:
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Only install `torch==2.0.1` from plain PyPI if you have a matching GPU/CUDA setup.
 safetensors==0.4.5         # checkpoint format — version-agnostic, no pickle
 
 # HuggingFace dataset push/pull
 huggingface_hub==0.26.2
+
+# Monitoring dashboard (monitor_server.py)
+flask==3.1.0
 
 # Numerical / scientific
 numpy==1.26.4
