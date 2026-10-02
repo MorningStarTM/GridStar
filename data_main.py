@@ -29,6 +29,7 @@ gen = SafetyDataGenerator(
     save_dir=SAVE_DIR,
     hf_dataset="ernestbeckham/gridstar-safety-data",
     hf_token=os.environ.get("HF_TOKEN"),   # set via: export HF_TOKEN=hf_xxx (or Kaggle Secrets)
+    delete_after_push=True,                # keeps local disk usage flat — 30GB is plenty
 )
 
 # ── Strategy 1: Random Policy ─────────────────────────────────────────────────
