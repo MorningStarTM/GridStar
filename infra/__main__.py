@@ -21,6 +21,8 @@ Usage:
     pulumi up
 """
 
+import os
+
 import pulumi
 import pulumi_aws as aws
 
@@ -28,7 +30,7 @@ config = pulumi.Config()
 start_episode = config.require_int("startEpisode")
 end_episode   = config.require_int("endEpisode")
 seed          = config.require_int("seed")
-my_ip         = config.require("myIp")
+my_ip         = os.environ["MY_IP"]
 key_name      = config.require("keyName")
 hf_token      = config.require_secret("hfToken")
 
