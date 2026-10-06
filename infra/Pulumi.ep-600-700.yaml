@@ -1,8 +1,8 @@
 config:
   aws:region: eu-north-1
   GridStar:startEpisode: "600"
-  GridStar:endEpisode: "900"
-  GridStar:myIp: 203.189.189.170/32
+  GridStar:endEpisode: "800"
   GridStar:keyName: gridstar-key
   GridStar:hfToken:
     secure: AAABAC0qdtMKRbneYL7q/41h6bLGukRI0XaoyX7UEgBVG7uIhh+VEHksI6//8EYbSEJWmD1VBuredEnwftpMM1LqR+09
+  GridStar:seed: "7"

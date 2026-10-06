@@ -1,0 +1,8 @@
+config:
+  aws:region: eu-north-1
+  GridStar:startEpisode: "300"
+  GridStar:endEpisode: "500"
+  GridStar:keyName: gridstar-key
+  GridStar:hfToken:
+    secure: AAABAD7FsjvP5k5J465CTRZOxReGqPuRoYB37v/LSvBcY2Gq64O+fV0t1kF8P2Gxfgz0ZVPVn5RvJUFaDipk/4fVnqvX
+  GridStar:seed: "13"
