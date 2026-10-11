@@ -483,56 +483,63 @@ class SafetyDataGenerator:
                     print(f"  env creation failed: {e}")
                     continue
 
-                for _chronic in range(n_scenarios):
-                    try:
-                        ep_env.reset()
+                # ep_env is never reused across (ep_id, line_id) pairs — MUST close
+                # it here, otherwise each fresh grid2op.make() leaks its backend
+                # (LightSimBackend C++ state included) and the process slowly OOMs
+                # over a long run (hundreds of env creations on a multi-day job).
+                try:
+                    for _chronic in range(n_scenarios):
+                        try:
+                            ep_env.reset()
 
-                        # Timestep advances with episode so all hours are covered;
-                        # wrapped by n_windows so it never exceeds max_duration.
-                        window   = ep_id % n_windows
-                        dst_step = (
-                            window * horizon_per_episode
-                            + random.randint(0, horizon_per_episode - 1)
-                        )
-                        dst_step = min(dst_step, max_duration - 1)
-                        ep_env.fast_forward_chronics(max(dst_step - 1, 0))
-                        obs, _r, done, _i = ep_env.step(ep_env.action_space({}))
-                        if done:
-                            continue
+                            # Timestep advances with episode so all hours are covered;
+                            # wrapped by n_windows so it never exceeds max_duration.
+                            window   = ep_id % n_windows
+                            dst_step = (
+                                window * horizon_per_episode
+                                + random.randint(0, horizon_per_episode - 1)
+                            )
+                            dst_step = min(dst_step, max_duration - 1)
+                            ep_env.fast_forward_chronics(max(dst_step - 1, 0))
+                            obs, _r, done, _i = ep_env.step(ep_env.action_space({}))
+                            if done:
+                                continue
 
-                        # Disconnect the target line
-                        disconnect = np.zeros(obs.rho.shape, dtype=np.int32)
-                        disconnect[line_id] = -1
-                        attack_action = ep_env.action_space({"set_line_status": disconnect})
-                        obs, _r, done, _i = ep_env.step(attack_action)
-                        if done:
-                            continue
+                            # Disconnect the target line
+                            disconnect = np.zeros(obs.rho.shape, dtype=np.int32)
+                            disconnect[line_id] = -1
+                            attack_action = ep_env.action_space({"set_line_status": disconnect})
+                            obs, _r, done, _i = ep_env.step(attack_action)
+                            if done:
+                                continue
 
-                        # Post-attack observation (-1 = line-disconnect, not in action space)
-                        obs_vecs.append(self.env.obs_to_vector(obs))
-                        labels.append(float(self._label(obs)))
-                        rho_vals.append(float(obs.rho.max()))
-                        steps.append(dst_step)
-                        action_idxs.append(-1)
+                            # Post-attack observation (-1 = line-disconnect, not in action space)
+                            obs_vecs.append(self.env.obs_to_vector(obs))
+                            labels.append(float(self._label(obs)))
+                            rho_vals.append(float(obs.rho.max()))
+                            steps.append(dst_step)
+                            action_idxs.append(-1)
 
-                        # Follow-up do-nothing steps (recovery window)
-                        for k in range(1, steps_after_attack + 1):
-                            try:
-                                obs_next, _r, done, _i = ep_env.step(self._do_nothing)
-                                obs_vecs.append(self.env.obs_to_vector(obs))
-                                labels.append(float(self._label(obs)))
-                                rho_vals.append(float(obs.rho.max()))
-                                steps.append(dst_step + k)
-                                action_idxs.append(self.env.do_nothing_idx)
-                                obs = obs_next
-                                if done:
+                            # Follow-up do-nothing steps (recovery window)
+                            for k in range(1, steps_after_attack + 1):
+                                try:
+                                    obs_next, _r, done, _i = ep_env.step(self._do_nothing)
+                                    obs_vecs.append(self.env.obs_to_vector(obs))
+                                    labels.append(float(self._label(obs)))
+                                    rho_vals.append(float(obs.rho.max()))
+                                    steps.append(dst_step + k)
+                                    action_idxs.append(self.env.do_nothing_idx)
+                                    obs = obs_next
+                                    if done:
+                                        break
+                                except Grid2OpException:
                                     break
-                            except Grid2OpException:
-                                break
 
-                    except Exception as e:
-                        print(f"  scenario error: {e}")
-                        continue
+                        except Exception as e:
+                            print(f"  scenario error: {e}")
+                            continue
+                finally:
+                    ep_env.close()
 
                 if obs_vecs:
                     fname = os.path.join(
