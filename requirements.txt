@@ -22,7 +22,6 @@ huggingface_hub==0.26.2
 flask==3.1.0
 
 # Numerical / scientific
-numpy==1.26.4
 scipy==1.16.3              # csr_matrix for connectivity matrix in actions.py
 
 # Graph / clustering
