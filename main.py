@@ -135,7 +135,13 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--weight-decay", type=float, default=1e-4,  help="Adam L2 weight decay.")
     g.add_argument("--batch-size",   type=int,   default=256,   help="Mini-batch size.")
     g.add_argument("--epochs",       type=int,   default=50,    help="Maximum training epochs.")
-    g.add_argument("--val-split",    type=float, default=0.15,  help="Validation fraction.")
+    g.add_argument("--val-split",    type=float, default=0.15,  help="Validation fraction (internal, used by fit() for early stopping).")
+    g.add_argument(
+        "--test-split", type=float, default=0.15,
+        help="Held-out test fraction, carved out BEFORE fit() ever sees the data — "
+             "used only for the final evaluation metrics, so they aren't computed on "
+             "data the model was partly trained on.",
+    )
     g.add_argument(
         "--patience", type=int, default=10,
         help="Early-stopping patience on validation loss.",
@@ -389,6 +395,20 @@ def run_safety_trainer(args: argparse.Namespace) -> None:
 
     obs_dim = obs_vectors.shape[1]
 
+    # ── Held-out test split ───────────────────────────────────────────────────
+    # fit() does its own internal train/val split (--val-split) for early
+    # stopping — but evaluating on the same obs_vectors/labels passed to fit()
+    # is data leakage. Carve out a separate test set FIRST, never shown to
+    # fit() at all, for a trustworthy final metric.
+    rng = np.random.default_rng(args.seed)
+    idx = rng.permutation(len(labels))
+    n_test = int(len(labels) * args.test_split)
+    test_idx, train_idx = idx[:n_test], idx[n_test:]
+
+    train_obs, train_labels = obs_vectors[train_idx], labels[train_idx]
+    test_obs,  test_labels  = obs_vectors[test_idx],  labels[test_idx]
+    print(f"Train: {len(train_labels)}  Test (held out): {len(test_labels)}")
+
     # ── Net-specific kwargs ───────────────────────────────────────────────────
     net_kwargs = {}
     if args.net == "deep":
@@ -417,11 +437,11 @@ def run_safety_trainer(args: argparse.Namespace) -> None:
     )
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    trainer.fit(obs_vectors, labels)
+    trainer.fit(train_obs, train_labels)
 
-    # ── Final evaluation on full dataset ──────────────────────────────────────
-    print("── Final evaluation (full dataset) ──")
-    metrics = trainer.evaluate(obs_vectors, labels)
+    # ── Final evaluation — on the held-out test split, never seen during fit() ──
+    print("── Final evaluation (held-out test set) ──")
+    metrics = trainer.evaluate(test_obs, test_labels)
     print(f"  loss      = {metrics['loss']:.4f}")
     print(f"  accuracy  = {metrics['acc']:.4f}")
     print(f"  precision = {metrics['precision']:.4f}")

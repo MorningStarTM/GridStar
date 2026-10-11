@@ -39,6 +39,23 @@ print(f"cached at {data_dir}")
 obs_vectors, labels = load_npz_dataset(data_dir, strategy=STRATEGY, max_files=None)
 print(f"Dataset: {obs_vectors.shape[0]} samples  obs_dim={obs_vectors.shape[1]}  pos_rate={labels.mean():.2%}")
 
+# ── Held-out test split ───────────────────────────────────────────────────────
+# fit() does its own internal train/val split (val_split below) for early
+# stopping — but evaluating on the same obs_vectors/labels passed to fit() is
+# data leakage (the model trained on most of it). Carve out a separate test
+# set FIRST, never shown to fit() at all, for a trustworthy final metric.
+import numpy as np
+
+TEST_SPLIT = 0.15
+rng = np.random.default_rng(42)
+idx = rng.permutation(len(labels))
+n_test = int(len(labels) * TEST_SPLIT)
+test_idx, train_idx = idx[:n_test], idx[n_test:]
+
+train_obs, train_labels = obs_vectors[train_idx], labels[train_idx]
+test_obs,  test_labels  = obs_vectors[test_idx],  labels[test_idx]
+print(f"Train: {len(train_labels)}  Test (held out): {len(test_labels)}")
+
 # ── Train ────────────────────────────────────────────────────────────────────
 trainer = SafetyPredictorTrainer(
     obs_dim=obs_vectors.shape[1],
@@ -49,7 +66,7 @@ trainer = SafetyPredictorTrainer(
     weight_decay=1e-4,
     batch_size=256,
     epochs=50,
-    val_split=0.15,
+    val_split=0.15,       # internal split of train_obs/train_labels, for early stopping only
     patience=10,
     threshold=0.9,
     save_dir="/kaggle/working/checkpoints/safety",
@@ -58,11 +75,11 @@ trainer = SafetyPredictorTrainer(
     seed=42,
 )
 
-history = trainer.fit(obs_vectors, labels)
+history = trainer.fit(train_obs, train_labels)
 
-# ── Final evaluation ─────────────────────────────────────────────────────────
-metrics = trainer.evaluate(obs_vectors, labels)
-print("── Final evaluation ──")
+# ── Final evaluation — on the held-out test split, never seen during fit() ──
+metrics = trainer.evaluate(test_obs, test_labels)
+print("── Final evaluation (held-out test set) ──")
 print(f"  loss      = {metrics['loss']:.4f}")
 print(f"  accuracy  = {metrics['acc']:.4f}")
 print(f"  precision = {metrics['precision']:.4f}")
