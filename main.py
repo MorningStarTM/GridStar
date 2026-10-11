@@ -29,6 +29,18 @@ Examples
   # Pull only a range of random-policy episodes — much lighter on GPU/disk/network
   python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
       --strategy random --start-episode 0 --end-episode 50
+
+  # Pull only ~20% of the attack-strategy files, randomly — quick smaller pull
+  python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
+      --strategy attack --fraction 0.2
+
+  # Train across multiple 12h Kaggle sessions, one non-overlapping slice each:
+  #   session 1:
+  python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
+      --strategy attack --num-slices 5 --slice-index 0
+  #   session 2 (different slice, same total slice count — no overlap with session 1):
+  python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
+      --strategy attack --num-slices 5 --slice-index 1
 """
 
 import argparse
@@ -73,6 +85,26 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
     g.add_argument(
         "--end-episode", type=int, default=None,
         help="Last episode id to pull from HF (exclusive). Requires --strategy and --hf-dataset.",
+    )
+    g.add_argument(
+        "--fraction", type=float, default=None,
+        help="Pull only this fraction (0-1] of matching files from HF, randomly sampled "
+             "(seeded by --seed). Useful for a quick smaller pull, but doesn't guarantee "
+             "coverage across repeated calls — prefer --num-slices/--slice-index for "
+             "training across multiple sessions without overlap. Requires --hf-dataset.",
+    )
+    g.add_argument(
+        "--num-slices", type=int, default=None,
+        help="Split matching HF files into this many non-overlapping, deterministic "
+             "chunks. Use with --slice-index to train on one chunk per session (e.g. "
+             "one 12h Kaggle run per slice) with guaranteed no duplicate/skipped files "
+             "across the full set of slices. Requires --hf-dataset.",
+    )
+    g.add_argument(
+        "--slice-index", type=int, default=None,
+        help="Which chunk (0-based) to pull when --num-slices is set. "
+             "E.g. --num-slices 5 --slice-index 0 pulls the first 1/5; "
+             "--slice-index 1 the next 1/5 on your next session; etc.",
     )
 
     g = p.add_argument_group("Model")
@@ -162,12 +194,72 @@ def _build_hf_allow_patterns(strategy: str = None, start_episode: int = None, en
     return None  # no filter — full dataset
 
 
+def list_hf_npz_files(repo_id: str, token: str = None, strategy: str = None):
+    """
+    List .npz files in the HF dataset repo WITHOUT downloading them — cheap
+    metadata-only API call, used to compute fraction/slice subsets before
+    pulling any actual data.
+    """
+    from huggingface_hub import HfApi
+
+    token = token or os.environ.get("HF_TOKEN")
+    api = HfApi(token=token)
+    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    files = [f for f in files if f.endswith(".npz")]
+    if strategy:
+        files = [f for f in files if f.startswith(f"{strategy}/")]
+    return files
+
+
+def _hf_candidates(repo_id, token, strategy, start_episode, end_episode):
+    """List + episode-range-filter HF files; shared by fraction and slice modes."""
+    candidates = list_hf_npz_files(repo_id, token=token, strategy=strategy)
+    if start_episode is not None and end_episode is not None:
+        episode_ids = set(range(start_episode, end_episode))
+        candidates = [
+            f for f in candidates
+            if any(f"_{i}.npz" in f for i in episode_ids)
+        ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No .npz files found for strategy={strategy!r} in {repo_id} "
+            f"(episode range {start_episode}-{end_episode})."
+        )
+    return sorted(candidates)  # deterministic order — required for slicing to be stable
+
+
+def _slice_files(files: list, num_slices: int, slice_index: int) -> list:
+    """
+    Split `files` (already sorted) into `num_slices` contiguous, non-overlapping,
+    near-equal chunks and return chunk `slice_index` (0-based).
+
+    Deterministic — same inputs always produce the same chunk, so repeated
+    calls across sessions (e.g. one Kaggle 12h session per slice) never
+    overlap and together cover every file exactly once.
+    """
+    if num_slices < 1:
+        raise ValueError(f"--num-slices must be >= 1, got {num_slices}")
+    if not (0 <= slice_index < num_slices):
+        raise ValueError(f"--slice-index must be in [0, {num_slices}), got {slice_index}")
+
+    n = len(files)
+    base, remainder = divmod(n, num_slices)
+    # First `remainder` slices get one extra file so all slices differ by at most 1 file.
+    start = slice_index * base + min(slice_index, remainder)
+    size  = base + (1 if slice_index < remainder else 0)
+    return files[start:start + size]
+
+
 def download_hf_dataset(
     repo_id: str,
     token: str = None,
     strategy: str = None,
     start_episode: int = None,
     end_episode: int = None,
+    fraction: float = None,
+    num_slices: int = None,
+    slice_index: int = None,
+    seed: int = 42,
 ) -> str:
     """
     Download (or reuse cached) HuggingFace dataset repo; returns local dir.
@@ -175,13 +267,54 @@ def download_hf_dataset(
     When `strategy` (and optionally an episode range) is given, only the
     matching files are downloaded via `allow_patterns` — much lighter on
     network/disk/GPU-idle-time than pulling the entire dataset.
+
+    Two mutually-exclusive ways to pull less than everything:
+
+    - `num_slices`/`slice_index`: deterministic, non-overlapping partition.
+      E.g. num_slices=5, slice_index=0 pulls exactly the first 1/5 of the
+      matching files (sorted, stable order); slice_index=1 the next 1/5, etc.
+      Use this to train across multiple sessions (one slice per Kaggle 12h
+      run) with zero duplicate or skipped files once you've gone through all
+      slices. PREFERRED for iterative training.
+
+    - `fraction`: random subsample (0 < fraction <= 1), seeded by `seed`.
+      Different calls with the same seed return the same files, but there's
+      no guarantee of coverage/no-overlap across different fraction calls —
+      use slicing instead if you plan to train on multiple non-overlapping
+      chunks over time.
     """
     from huggingface_hub import snapshot_download
 
     token = token or os.environ.get("HF_TOKEN")
-    allow_patterns = _build_hf_allow_patterns(strategy, start_episode, end_episode)
-    if allow_patterns:
-        print(f"  pulling {len(allow_patterns)} pattern(s): {allow_patterns[:3]}{' ...' if len(allow_patterns) > 3 else ''}")
+
+    if num_slices is not None or slice_index is not None:
+        if num_slices is None or slice_index is None:
+            raise ValueError("--num-slices and --slice-index must be set together.")
+        candidates = _hf_candidates(repo_id, token, strategy, start_episode, end_episode)
+        allow_patterns = _slice_files(candidates, num_slices, slice_index)
+        print(
+            f"  slice {slice_index + 1}/{num_slices} of {len(candidates)} candidate files "
+            f"-> pulling {len(allow_patterns)} file(s)"
+        )
+
+    elif fraction is not None:
+        if not (0 < fraction <= 1):
+            raise ValueError(f"--fraction must be in (0, 1], got {fraction}")
+        import random as _random
+
+        candidates = _hf_candidates(repo_id, token, strategy, start_episode, end_episode)
+        n_select = max(1, round(len(candidates) * fraction))
+        _random.seed(seed)
+        allow_patterns = sorted(_random.sample(candidates, n_select))
+        print(
+            f"  fraction={fraction:.0%} of {len(candidates)} candidate files "
+            f"-> pulling {len(allow_patterns)} file(s) (seed={seed})"
+        )
+
+    else:
+        allow_patterns = _build_hf_allow_patterns(strategy, start_episode, end_episode)
+        if allow_patterns:
+            print(f"  pulling {len(allow_patterns)} pattern(s): {allow_patterns[:3]}{' ...' if len(allow_patterns) > 3 else ''}")
 
     local_dir = snapshot_download(
         repo_id=repo_id,
@@ -238,6 +371,10 @@ def run_safety_trainer(args: argparse.Namespace) -> None:
             strategy=args.strategy,
             start_episode=args.start_episode,
             end_episode=args.end_episode,
+            fraction=args.fraction,
+            num_slices=args.num_slices,
+            slice_index=args.slice_index,
+            seed=args.seed,
         )
         print(f"  cached at {data_dir}")
     else:
