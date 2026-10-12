@@ -57,6 +57,13 @@ test_obs,  test_labels  = obs_vectors[test_idx],  labels[test_idx]
 print(f"Train: {len(train_labels)}  Test (held out): {len(test_labels)}")
 
 # ── Train ────────────────────────────────────────────────────────────────────
+# MULTI_GPU wraps the model in nn.DataParallel across Kaggle's dual GPU session
+# (no-op automatically if only one GPU, or CPU, is visible). Each batch gets
+# split across both GPUs — since that halves the per-GPU batch, consider
+# bumping BATCH_SIZE (e.g. 256 -> 512) to keep each GPU's share meaningful.
+MULTI_GPU  = True
+BATCH_SIZE = 512
+
 trainer = SafetyPredictorTrainer(
     obs_dim=obs_vectors.shape[1],
     net="efficient",
@@ -64,7 +71,7 @@ trainer = SafetyPredictorTrainer(
     dropout=0.1,
     lr=1e-3,
     weight_decay=1e-4,
-    batch_size=256,
+    batch_size=BATCH_SIZE,
     epochs=50,
     val_split=0.15,       # internal split of train_obs/train_labels, for early stopping only
     patience=10,
@@ -73,6 +80,7 @@ trainer = SafetyPredictorTrainer(
     checkpoint_name="safety_predictor.safetensors",
     device="auto",
     seed=42,
+    multi_gpu=MULTI_GPU,
 )
 
 history = trainer.fit(train_obs, train_labels)
