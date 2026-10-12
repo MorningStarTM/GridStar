@@ -41,6 +41,10 @@ Examples
   #   session 2 (different slice, same total slice count — no overlap with session 1):
   python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
       --strategy attack --num-slices 5 --slice-index 1
+
+  # Data parallel across Kaggle's dual GPU — splits each batch across both
+  python main.py safety_trainer --hf-dataset owner/gridstar-safety-data \\
+      --strategy attack --device cuda --multi-gpu
 """
 
 import argparse
@@ -155,6 +159,12 @@ def _add_safety_trainer_args(p: argparse.ArgumentParser) -> None:
         help="'auto' (GPU if available), 'cpu', 'cuda', or 'cuda:N'.",
     )
     g.add_argument("--seed", type=int, default=42, help="Random seed.")
+    g.add_argument(
+        "--multi-gpu", action="store_true",
+        help="Wrap the model in nn.DataParallel across all visible CUDA devices "
+             "(e.g. Kaggle's dual-GPU sessions). No-op on CPU or a single GPU. "
+             "Checkpoints stay portable — saved/loaded from the unwrapped model.",
+    )
 
     g = p.add_argument_group("Output")
     g.add_argument(
@@ -433,6 +443,7 @@ def run_safety_trainer(args: argparse.Namespace) -> None:
         checkpoint_name=args.checkpoint_name,
         device=args.device,
         seed=args.seed,
+        multi_gpu=args.multi_gpu,
         **net_kwargs,
     )
 
