@@ -93,6 +93,12 @@ class SafetyPredictorTrainer:
                       (default safety_predictor.safetensors).
     device:           'auto', 'cpu', 'cuda', or 'cuda:N' (default 'auto').
     seed:             random seed for reproducible train/val splits (default 42).
+    multi_gpu:        wrap the model in nn.DataParallel across all visible CUDA
+                      devices (default False). No-op if device is CPU or only
+                      one GPU is visible. Checkpoints are always saved/loaded
+                      from the UNWRAPPED model, so they stay portable — a
+                      multi_gpu=True checkpoint loads identically on a single
+                      GPU or CPU later (e.g. for AStarSearch inference).
     **net_kwargs:     forwarded to the backbone — e.g. n_blocks=4 for 'deep',
                       n_members=7 for 'ensemble'.
     """
@@ -114,6 +120,7 @@ class SafetyPredictorTrainer:
         checkpoint_name: str = "safety_predictor.safetensors",
         device: str = "auto",
         seed: int = 42,
+        multi_gpu: bool = False,
         **net_kwargs,
     ):
         torch.manual_seed(seed)
@@ -124,9 +131,26 @@ class SafetyPredictorTrainer:
         else:
             self.device = torch.device(device)
 
+        # self._model is ALWAYS the raw, unwrapped module — used for save/load/
+        # predict so checkpoints and inference never depend on DataParallel.
         self._model = SafetyPredictor(
             obs_dim, net=net, hidden_dim=hidden_dim, dropout=dropout, **net_kwargs
         ).to(self.device)
+
+        # self._forward_model is what fit()/evaluate() actually call — wrapped
+        # in DataParallel when multi_gpu is requested and multiple GPUs are
+        # visible, otherwise identical to self._model.
+        self.n_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
+        self.multi_gpu = bool(multi_gpu) and self.n_gpus > 1
+        if multi_gpu and not self.multi_gpu:
+            reason = "device is not cuda" if self.device.type != "cuda" else f"only {self.n_gpus} GPU visible"
+            print(f"multi_gpu requested but ignored ({reason}).")
+
+        if self.multi_gpu:
+            self._forward_model = nn.DataParallel(self._model)
+            print(f"DataParallel enabled across {self.n_gpus} GPUs.")
+        else:
+            self._forward_model = self._model
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -189,10 +213,11 @@ class SafetyPredictorTrainer:
         patience_counter = 0
 
         print(f"\n{self._model}")
+        gpu_note = f"  multi_gpu={self.n_gpus}x" if self.multi_gpu else ""
         print(
             f"Train: {n_train}  Val: {n_val}  "
             f"pos_rate={pos_rate:.2%}  pos_weight={pos_weight.item():.3f}  "
-            f"device={self.device}\n"
+            f"device={self.device}{gpu_note}\n"
         )
         _sep = "-" * 90
         print(_sep)
@@ -206,12 +231,12 @@ class SafetyPredictorTrainer:
             t0 = time.time()
 
             # ── Training pass ────────────────────────────────────────────────
-            self._model.train()
+            self._forward_model.train()
             running_loss = 0.0
             for xb, yb in train_loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
                 optimizer.zero_grad()
-                loss = criterion(self._model(xb), yb)
+                loss = criterion(self._forward_model(xb), yb)
                 loss.backward()
                 optimizer.step()
                 running_loss += loss.item() * len(xb)
@@ -310,7 +335,7 @@ class SafetyPredictorTrainer:
 
     def _eval_loader(self, loader: DataLoader, criterion: nn.Module) -> Dict:
         """Run one evaluation pass; return metrics dict."""
-        self._model.eval()
+        self._forward_model.eval()
         total_loss = 0.0
         total = 0
         all_probs, all_labels = [], []
@@ -318,7 +343,7 @@ class SafetyPredictorTrainer:
         with torch.no_grad():
             for xb, yb in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
-                logits = self._model(xb)
+                logits = self._forward_model(xb)
                 total_loss += criterion(logits, yb).item() * len(xb)
                 total      += len(xb)
                 all_probs.append(torch.sigmoid(logits).cpu())
