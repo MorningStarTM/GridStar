@@ -1,8 +1,10 @@
 """
-Safety predictor data generator.
+Safety predictor + heuristic model data generator.
 
-Three collection strategies, each producing (obs_vector, label) pairs where
-label = 1 means the grid stays safe for K consecutive do-nothing steps.
+Three safety-label strategies, each producing (obs_vector, label) pairs where
+label = 1 means the grid stays safe for K consecutive do-nothing steps, plus
+one heuristic strategy producing (obs_vector, g_star) regression pairs for
+training HeuristicModel's h(s).
 
 Strategies
 ──────────
@@ -20,18 +22,30 @@ Strategies
                          (episode, line) pair; samples dst_step = ep * horizon
                          + rand to cover different times of day across episodes.
 
+  from_astar_heuristic — runs real A* search (needs a trained SafetyPredictor
+                         as the searcher's safety_fn to be useful) and reads
+                         g_star = goal_node.g - node.g off every node on the
+                         found optimal path. Episodes where no goal is found
+                         contribute nothing (no valid optimal-cost signal).
+
 Saved files
 ───────────
   <save_dir>/random/episode_{id}.npz
   <save_dir>/trained/episode_{id}.npz
   <save_dir>/attack/line_{lid}_ep_{eid}.npz
+  <save_dir>/heuristic/episode_{id}.npz
 
-Each .npz contains:
+Each safety-strategy .npz (random/trained/attack) contains:
   obs_vectors : float32  (N, obs_dim)  — flat observation vectors
   labels      : float32  (N,)          — 0.0 (unsafe) or 1.0 (safe for K steps)
   rho_max     : float32  (N,)          — max line loading at each observation
   steps       : int32    (N,)          — timestep within the episode
   actions     : int32    (N,)          — action index into env.actions (-1 = line-disconnect)
+
+Each heuristic .npz (heuristic/) contains:
+  obs_vectors : float32  (N, obs_dim)  — flat observation vectors, path nodes only
+  g_star      : float32  (N,)          — exact optimal cost-to-goal from that node
+  depth       : int32    (N,)          — tree depth of the node (0 = root)
 """
 
 import os
@@ -180,9 +194,10 @@ class SafetyDataGenerator:
         )
         self._do_nothing = self.env.actions[self.env.do_nothing_idx]
 
-        os.makedirs(os.path.join(save_dir, "random"),  exist_ok=True)
-        os.makedirs(os.path.join(save_dir, "trained"), exist_ok=True)
-        os.makedirs(os.path.join(save_dir, "attack"),  exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "random"),    exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "trained"),   exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "attack"),    exist_ok=True)
+        os.makedirs(os.path.join(save_dir, "heuristic"), exist_ok=True)
 
         if kaggle_dataset:
             self._init_kaggle_metadata(kaggle_dataset)
@@ -556,6 +571,107 @@ class SafetyDataGenerator:
                     pushed_ok = self._push_to_hf(fname)
                     self._maybe_delete_local(fname, pushed_ok)
 
+    # ── Strategy 4: A* Heuristic (g_star labels) ──────────────────────────────
+
+    def from_astar_heuristic(
+        self,
+        searcher,
+        n_episodes: Optional[int] = None,
+        start_episode: int = 0,
+        end_episode: Optional[int] = None,
+        max_steps_to_congestion: int = 2000,
+    ) -> None:
+        """
+        Collect (obs, g_star) regression pairs for training HeuristicModel's h(s).
+
+        Advances each episode to a congested state, runs `searcher.search(obs)`,
+        and — only when a goal is found — reads the EXACT optimal cost-to-goal
+        off every node on the found path:
+
+            g_star(node) = goal_node.g - node.g
+
+        This is only valid for nodes on `result.path`: A* guarantees g(node) is
+        optimal for path nodes (that's what makes it the extracted solution),
+        but NOT for arbitrary nodes in `result.all_nodes` — many of those were
+        generated but never fully explored, so their true remaining cost to a
+        goal is unknown. Off-path nodes are therefore not used here.
+
+        For this to produce useful search trees, pass a `searcher` whose
+        `safety_fn` is a TRAINED SafetyPredictor's goal test (not None) —
+        otherwise A* falls back to the exact-only goal check, which works but
+        explores far more nodes per search (see AStarSearch docstring).
+
+        Episodes where A* doesn't find a goal within `max_expansions` are
+        skipped entirely — there is no optimal-cost signal to extract from an
+        incomplete search.
+
+        Args:
+            searcher:                AStarSearch instance. Pass a policy with
+                                     a trained heuristic warm-start if you have
+                                     one yet, otherwise RandomPolicy (h=0) is
+                                     the standard bootstrap baseline.
+            n_episodes:              number of chronics to run. Ignored when
+                                     end_episode is set.
+            start_episode:           first chronic ID (inclusive).
+            end_episode:             last chronic ID (exclusive). When set,
+                                     overrides n_episodes.
+            max_steps_to_congestion: steps to advance before giving up on
+                                     finding congestion.
+        """
+        if end_episode is not None:
+            end = min(end_episode, self.env.chronic_count)
+        else:
+            n_eps = n_episodes or self.env.chronic_count
+            end   = min(start_episode + n_eps, self.env.chronic_count)
+
+        self._clear_stop_flag()
+
+        for ep_id in range(start_episode, end):
+            if self._stop_requested():
+                print(f"[heuristic] stop requested — halting before episode {ep_id}.")
+                break
+
+            print(f"[heuristic] episode {ep_id}/{end - 1}")
+            obs = self.env.reset(chronic_id=ep_id)
+            obs = self.env.advance_to_congestion(obs, max_steps=max_steps_to_congestion)
+
+            if not self.env.is_congested(obs):
+                print("  no congestion found — skipping.")
+                continue
+
+            print(f"  ρ_max={self.env.get_rho_max(obs):.4f}  running A*...")
+            result = searcher.search(obs)
+            print(
+                f"  found={result.found}  "
+                f"nodes={len(result.all_nodes)}  "
+                f"expanded={result.n_expanded}"
+            )
+
+            if not result.found:
+                print("  no goal found — skipping (no valid g_star signal).")
+                continue
+
+            obs_vecs: list = []
+            g_star:   list = []
+            depths:   list = []
+
+            goal_g = result.goal_node.g
+            for node in result.path:
+                obs_vecs.append(self.env.obs_to_vector(node.obs))
+                g_star.append(float(goal_g - node.g))
+                depths.append(node.depth)
+
+            fname = os.path.join(self.save_dir, "heuristic", f"episode_{ep_id}.npz")
+            self._save_heuristic(obs_vecs, g_star, depths, fname)
+            print(f"  {len(g_star)} path nodes  g_star range=[{min(g_star):.3f}, {max(g_star):.3f}]")
+            self._write_status(
+                "heuristic", ep_id, len(g_star), len(g_star),
+                extra={"range": [start_episode, end], "found": result.found},
+            )
+            self._push_to_kaggle(f"heuristic episode_{ep_id}")
+            pushed_ok = self._push_to_hf(fname)
+            self._maybe_delete_local(fname, pushed_ok)
+
     # ── Load ──────────────────────────────────────────────────────────────────
 
     def load(
@@ -644,6 +760,25 @@ class SafetyDataGenerator:
         np.savez_compressed(filepath, **arrays)
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"  [{ts}] → {filepath}  ({len(obs_vecs)} steps)")
+
+    def _save_heuristic(
+        self,
+        obs_vecs: list,
+        g_star: list,
+        depths: list,
+        filepath: str,
+    ) -> None:
+        """Save one episode's (obs, g_star) regression pairs to a compressed .npz file."""
+        if not obs_vecs:
+            return
+        np.savez_compressed(
+            filepath,
+            obs_vectors=np.array(obs_vecs, dtype=np.float32),
+            g_star=np.array(g_star,        dtype=np.float32),
+            depth=np.array(depths,         dtype=np.int32),
+        )
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  [{ts}] → {filepath}  ({len(obs_vecs)} nodes)")
 
     # ── Monitoring / remote stop ─────────────────────────────────────────────
 
