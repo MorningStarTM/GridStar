@@ -580,6 +580,8 @@ class SafetyDataGenerator:
         start_episode: int = 0,
         end_episode: Optional[int] = None,
         max_steps_to_congestion: int = 2000,
+        max_attempts: int = 5,
+        min_forecast_buffer: Optional[int] = None,
     ) -> None:
         """
         Collect (obs, g_star) regression pairs for training HeuristicModel's h(s).
@@ -605,6 +607,25 @@ class SafetyDataGenerator:
         skipped entirely — there is no optimal-cost signal to extract from an
         incomplete search.
 
+        ── Retry loop with randomized start offset ────────────────────────────
+
+        `advance_to_congestion` stops the instant ρ crosses threshold, with no
+        awareness of how close that is to the chronic's end. If a chronic's
+        do-nothing congestion point naturally lands very late, there's little
+        or no forecast room left — EVERY action A* tries from there fails
+        identically with NoForecastAvailable, regardless of top_k/max_depth
+        (diagnosed empirically: widening top_k 10→30 produced byte-identical
+        results on affected episodes).
+
+        To avoid handing A* a structurally-doomed starting point, each episode
+        gets up to `max_attempts` tries. Attempt 0 starts from the chronic's
+        natural beginning (unchanged behavior). Attempts 1+ fast-forward to a
+        RANDOM offset first — a plain retry from the same deterministic reset
+        point would just reproduce the identical congestion point every time,
+        so the randomization is what actually gives later attempts a chance at
+        a different outcome. A candidate is only accepted once congested AND
+        at least `min_forecast_buffer` steps remain before the chronic ends.
+
         Args:
             searcher:                AStarSearch instance. Pass a policy with
                                      a trained heuristic warm-start if you have
@@ -616,13 +637,27 @@ class SafetyDataGenerator:
             end_episode:             last chronic ID (exclusive). When set,
                                      overrides n_episodes.
             max_steps_to_congestion: steps to advance before giving up on
-                                     finding congestion.
+                                     finding congestion, per attempt.
+            max_attempts:            retries per episode before skipping it
+                                     entirely (default 5).
+            min_forecast_buffer:     minimum steps that must remain in the
+                                     chronic after the congested state for a
+                                     candidate to be accepted. Defaults to
+                                     `searcher.max_depth` — the worst case
+                                     depth A* might need to simulate ahead.
         """
         if end_episode is not None:
             end = min(end_episode, self.env.chronic_count)
         else:
             n_eps = n_episodes or self.env.chronic_count
             end   = min(start_episode + n_eps, self.env.chronic_count)
+
+        min_forecast_buffer = min_forecast_buffer or getattr(searcher, "max_depth", 5)
+        max_duration = self.env.env.max_episode_duration()
+        # Worst-case room attempt 0's do-nothing walk could consume, so later
+        # random offsets still leave min_forecast_buffer steps after whatever
+        # advance_to_congestion finds from that offset.
+        max_offset = max(max_duration - max_steps_to_congestion - min_forecast_buffer, 0)
 
         self._clear_stop_flag()
 
@@ -632,11 +667,41 @@ class SafetyDataGenerator:
                 break
 
             print(f"[heuristic] episode {ep_id}/{end - 1}")
-            obs = self.env.reset(chronic_id=ep_id)
-            obs = self.env.advance_to_congestion(obs, max_steps=max_steps_to_congestion)
 
-            if not self.env.is_congested(obs):
-                print("  no congestion found — skipping.")
+            obs = None
+            raw = self.env.env
+            for attempt in range(max_attempts):
+                raw.set_id(ep_id)
+                candidate = raw.reset()
+
+                if attempt > 0 and max_offset > 0:
+                    offset = random.randint(0, max_offset)
+                    raw.fast_forward_chronics(offset)
+                    candidate = raw.get_obs()
+                    print(f"  attempt {attempt + 1}/{max_attempts}: random offset={offset}")
+
+                try:
+                    candidate = self.env.advance_to_congestion(candidate, max_steps=max_steps_to_congestion)
+                except (NoForecastAvailable, Grid2OpException):
+                    continue
+
+                if not self.env.is_congested(candidate):
+                    print(f"  attempt {attempt + 1}/{max_attempts}: no congestion found, retrying...")
+                    continue
+
+                steps_left = max_duration - candidate.current_step
+                if steps_left < min_forecast_buffer:
+                    print(
+                        f"  attempt {attempt + 1}/{max_attempts}: congested but only "
+                        f"{steps_left} forecast steps left (<{min_forecast_buffer}), retrying..."
+                    )
+                    continue
+
+                obs = candidate
+                break
+
+            if obs is None:
+                print(f"  no usable congested state found after {max_attempts} attempts — skipping.")
                 continue
 
             print(f"  ρ_max={self.env.get_rho_max(obs):.4f}  running A*...")

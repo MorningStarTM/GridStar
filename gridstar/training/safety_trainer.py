@@ -137,6 +137,12 @@ class SafetyPredictorTrainer:
             obs_dim, net=net, hidden_dim=hidden_dim, dropout=dropout, **net_kwargs
         ).to(self.device)
 
+        # Retained so save() can persist the full architecture (hidden_dim +
+        # any net_kwargs like n_blocks/n_members) to checkpoint metadata —
+        # otherwise a non-default hidden_dim can't be reconstructed on load().
+        self._hidden_dim = hidden_dim
+        self._net_kwargs = net_kwargs
+
         # self._forward_model is what fit()/evaluate() actually call — wrapped
         # in DataParallel when multi_gpu is requested and multiple GPUs are
         # visible, otherwise identical to self._model.
@@ -306,13 +312,17 @@ class SafetyPredictorTrainer:
         load cleanly across different torch versions and don't execute
         arbitrary code on load. Loadable with load().
         """
+        import json
+
         path = path or self.checkpoint_path
         state_dict = self._model.state_dict()
         tensors = {k: v.contiguous().cpu() for k, v in state_dict.items()}
         metadata = {
-            "obs_dim":   str(self._model.obs_dim),
-            "net_name":  self._model.net_name,
-            "threshold": str(self.threshold),
+            "obs_dim":    str(self._model.obs_dim),
+            "net_name":   self._model.net_name,
+            "threshold":  str(self.threshold),
+            "hidden_dim": str(self._hidden_dim),
+            "net_kwargs": json.dumps(self._net_kwargs),  # e.g. {"n_blocks": 4} for 'deep'
         }
         save_file(tensors, path, metadata=metadata)
 

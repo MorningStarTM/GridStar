@@ -3,6 +3,8 @@ import itertools
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from grid2op.Exceptions import Grid2OpException, NoForecastAvailable
+
 from .node import SearchNode
 from .goal import is_goal
 from gridstar.grid_env.reward import RewardFunction
@@ -146,7 +148,14 @@ class AStarSearch:
                 continue
 
             for action_idx in self.policy.top_k_actions(node.obs, self.top_k):
-                child_obs, _, done, info = self.env.simulate(node.obs, action_idx)
+                try:
+                    child_obs, _, done, info = self.env.simulate(node.obs, action_idx)
+                except (NoForecastAvailable, Grid2OpException):
+                    # Can't simulate this far ahead (e.g. too close to the end
+                    # of the chronic's data) — treat like a dead branch, not a
+                    # fatal error. Matches how done/illegal/ambiguous actions
+                    # are already skipped just below.
+                    continue
 
                 if done or info.get("is_illegal", False) or info.get("is_ambiguous", False):
                     continue
