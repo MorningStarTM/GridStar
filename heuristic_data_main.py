@@ -48,6 +48,10 @@ MAX_ATTEMPTS            = int(os.environ.get("MAX_ATTEMPTS", 5))
 MIN_FORECAST_BUFFER     = (
     int(os.environ["MIN_FORECAST_BUFFER"]) if "MIN_FORECAST_BUFFER" in os.environ else None
 )
+# Extra do-nothing steps after congestion is first detected, to let it deepen
+# before A* searches from it — without this, every success was a trivial
+# 1-step fix (empirically confirmed: 20/20 sampled files had exactly 2 nodes).
+CONGESTION_RIDE_OUT_STEPS = int(os.environ.get("CONGESTION_RIDE_OUT_STEPS", 4))
 
 print(f'Episode range: {START_EPISODE} -> {END_EPISODE}  seed={SEED}')
 
@@ -116,4 +120,5 @@ gen.from_astar_heuristic(
     max_steps_to_congestion=MAX_STEPS_TO_CONGESTION,
     max_attempts=MAX_ATTEMPTS,
     min_forecast_buffer=MIN_FORECAST_BUFFER,
+    congestion_ride_out_steps=CONGESTION_RIDE_OUT_STEPS,
 )
