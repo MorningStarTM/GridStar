@@ -582,6 +582,7 @@ class SafetyDataGenerator:
         max_steps_to_congestion: int = 2000,
         max_attempts: int = 5,
         min_forecast_buffer: Optional[int] = None,
+        congestion_ride_out_steps: int = 4,
     ) -> None:
         """
         Collect (obs, g_star) regression pairs for training HeuristicModel's h(s).
@@ -626,6 +627,22 @@ class SafetyDataGenerator:
         a different outcome. A candidate is only accepted once congested AND
         at least `min_forecast_buffer` steps remain before the chronic ends.
 
+        ── Congestion ride-out ─────────────────────────────────────────────────
+
+        `advance_to_congestion` stops the INSTANT ρ first crosses threshold —
+        the mildest possible moment of congestion, not a developed crisis.
+        Diagnosed empirically: sampling saved files showed EVERY successful
+        search found a goal at depth 1 (2-node path) regardless of max_depth,
+        because on a small grid, at least one of `top_k` random actions almost
+        always fixes a just-barely-congested state in a single step. A* then
+        has no reason to search deeper.
+
+        After congestion is first detected, `congestion_ride_out_steps`
+        additional do-nothing steps are taken before handing the state to A*,
+        letting the crisis actually deepen. If the chronic ends, forecast runs
+        out, or congestion resolves on its own during the ride-out, that
+        attempt is abandoned and retried (same as any other failure mode).
+
         Args:
             searcher:                AStarSearch instance. Pass a policy with
                                      a trained heuristic warm-start if you have
@@ -645,6 +662,10 @@ class SafetyDataGenerator:
                                      candidate to be accepted. Defaults to
                                      `searcher.max_depth` — the worst case
                                      depth A* might need to simulate ahead.
+            congestion_ride_out_steps: extra do-nothing steps taken after
+                                     congestion is first detected, to let it
+                                     deepen before A* searches from it
+                                     (default 4).
         """
         if end_episode is not None:
             end = min(end_episode, self.env.chronic_count)
@@ -654,10 +675,13 @@ class SafetyDataGenerator:
 
         min_forecast_buffer = min_forecast_buffer or getattr(searcher, "max_depth", 5)
         max_duration = self.env.env.max_episode_duration()
-        # Worst-case room attempt 0's do-nothing walk could consume, so later
-        # random offsets still leave min_forecast_buffer steps after whatever
-        # advance_to_congestion finds from that offset.
-        max_offset = max(max_duration - max_steps_to_congestion - min_forecast_buffer, 0)
+        do_nothing_action = self.env.actions[self.env.do_nothing_idx]
+        # Worst-case room attempt 0's do-nothing walk + the ride-out could
+        # consume, so later random offsets still leave min_forecast_buffer
+        # steps after whatever advance_to_congestion + ride-out finds.
+        max_offset = max(
+            max_duration - max_steps_to_congestion - congestion_ride_out_steps - min_forecast_buffer, 0
+        )
 
         self._clear_stop_flag()
 
@@ -687,6 +711,26 @@ class SafetyDataGenerator:
 
                 if not self.env.is_congested(candidate):
                     print(f"  attempt {attempt + 1}/{max_attempts}: no congestion found, retrying...")
+                    continue
+
+                # Ride out a few more do-nothing steps so A* gets a deepened
+                # crisis instead of the mildest possible threshold crossing —
+                # see "Congestion ride-out" above for why this is needed.
+                ride_out_ok = True
+                for _ in range(congestion_ride_out_steps):
+                    try:
+                        candidate, _, done, _ = raw.step(do_nothing_action)
+                    except (NoForecastAvailable, Grid2OpException):
+                        ride_out_ok = False
+                        break
+                    if done:
+                        ride_out_ok = False
+                        break
+                if not ride_out_ok:
+                    print(f"  attempt {attempt + 1}/{max_attempts}: congestion ride-out hit done/no-forecast, retrying...")
+                    continue
+                if not self.env.is_congested(candidate):
+                    print(f"  attempt {attempt + 1}/{max_attempts}: congestion resolved during ride-out, retrying...")
                     continue
 
                 steps_left = max_duration - candidate.current_step
